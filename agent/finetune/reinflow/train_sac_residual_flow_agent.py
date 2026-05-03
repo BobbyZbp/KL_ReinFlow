@@ -83,6 +83,14 @@ class TrainSACResidualFlowAgent(TrainAgent):
         reward_buffer = deque(maxlen=self.buffer_size)
         terminated_buffer = deque(maxlen=self.buffer_size)
 
+        # Running per-env episode reward accumulators + finished-episode log.
+        # n_steps=1 means each iter only sees 1 env step, so we must accumulate
+        # reward across iters and only flush on `done`.
+        ep_running_reward = np.zeros(self.n_envs, dtype=np.float64)
+        ep_running_len = np.zeros(self.n_envs, dtype=np.int64)
+        completed_ep_rewards = deque(maxlen=200)
+        completed_ep_lens = deque(maxlen=200)
+
         timer = Timer()
         run_results = []
         cnt_train_step = 0
@@ -153,6 +161,17 @@ class TrainSACResidualFlowAgent(TrainAgent):
                     reward_buffer.extend((reward_venv * self.scale_reward_factor).tolist())
                     terminated_buffer.extend(terminated_venv.tolist())
 
+                    # Running episode reward / length, accumulated across iters.
+                    # Flush to completed_* deques whenever an env terminates or truncates.
+                    ep_running_reward += reward_venv
+                    ep_running_len += 1
+                    for i in range(self.n_envs):
+                        if done_venv[i]:
+                            completed_ep_rewards.append(float(ep_running_reward[i]))
+                            completed_ep_lens.append(int(ep_running_len[i]))
+                            ep_running_reward[i] = 0.0
+                            ep_running_len[i] = 0
+
                 prev_obs_venv = obs_venv
                 cnt_train_step += self.n_envs * self.act_steps if not eval_mode else 0
 
@@ -183,10 +202,19 @@ class TrainSACResidualFlowAgent(TrainAgent):
                     np.mean(episode_best_reward >= self.best_reward_threshold_for_success)
                 )
             else:
-                num_episode_finished = 0
-                avg_episode_reward = 0.0
-                avg_best_reward = 0.0
-                success_rate = 0.0
+                # Fall back to the running accumulator (mean over recent finished episodes).
+                if len(completed_ep_rewards) > 0:
+                    num_episode_finished = len(completed_ep_rewards)
+                    avg_episode_reward = float(np.mean(completed_ep_rewards))
+                    avg_best_reward = avg_episode_reward
+                    success_rate = float(
+                        np.mean(np.array(completed_ep_rewards) >= self.best_reward_threshold_for_success)
+                    )
+                else:
+                    num_episode_finished = 0
+                    avg_episode_reward = 0.0
+                    avg_best_reward = 0.0
+                    success_rate = 0.0
 
             # =================================================== updates
             if (
@@ -225,6 +253,8 @@ class TrainSACResidualFlowAgent(TrainAgent):
                 )
                 self.critic_optimizer.zero_grad()
                 loss_critic.backward()
+                # Clip critic gradients (defense against early-training Q-target divergence)
+                torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), max_norm=10.0)
                 self.critic_optimizer.step()
                 self.model.update_target_critic(self.target_ema_rate)
                 loss_critic_val = loss_critic.item()
@@ -234,6 +264,12 @@ class TrainSACResidualFlowAgent(TrainAgent):
                     loss_actor, last_actor_info = self.model.loss_actor(obs_dict)
                     self.actor_optimizer.zero_grad()
                     loss_actor.backward()
+                    # Clip actor gradients (the gradient chains through K-1 ODE Jacobians;
+                    # without this, occasional bad samples can produce huge updates)
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.model.v_res.parameters()) + list(self.model.sigma_head.parameters()),
+                        max_norm=1.0,
+                    )
                     self.actor_optimizer.step()
                     loss_actor_val = loss_actor.item()
 
