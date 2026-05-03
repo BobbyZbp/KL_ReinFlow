@@ -47,9 +47,10 @@ class TrainSACResidualFlowAgent(TrainAgent):
         self.scale_reward_factor = cfg.train.scale_reward_factor
         self.batch_size = cfg.train.batch_size
 
-        # update frequencies (assume single env, like flow_baselines/train_sac_agent.py)
-        self.critic_update_freq = int(cfg.train.batch_size / cfg.train.critic_replay_ratio)
-        self.actor_update_freq = int(cfg.train.batch_size / cfg.train.actor_replay_ratio)
+        # update frequencies (assume single env, like flow_baselines/train_sac_agent.py).
+        # max(1, ...) defends against bad config that would give freq=0 (modulo-by-zero).
+        self.critic_update_freq = max(1, int(cfg.train.batch_size / cfg.train.critic_replay_ratio))
+        self.actor_update_freq = max(1, int(cfg.train.batch_size / cfg.train.actor_replay_ratio))
 
         self.buffer_size = cfg.train.buffer_size
         self.n_eval_episode = cfg.train.n_eval_episode

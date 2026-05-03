@@ -66,8 +66,8 @@ train:
   buffer_size: 1000000
   n_eval_episode: 40
   n_explore_steps: 5000
-  critic_replay_ratio: 256           # one critic update per batch worth of env steps
-  actor_replay_ratio: 512            # delayed actor (every 2 critic updates)
+  critic_replay_ratio: 256           # update_freq = batch_size / replay_ratio = 256/256 = 1 (every iter)
+  actor_replay_ratio: 128            # update_freq = 256/128 = 2 (delayed actor, every 2 iters)
   save_model_freq: 5000
   val_freq: 5000
   render:
