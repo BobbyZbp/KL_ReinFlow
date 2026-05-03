@@ -8,7 +8,7 @@ Architecture (per New Project Idea 0501):
   for k = 0..K-2:                                         # deterministic ODE
     a^{k+1} = a^k + (v_base + v_res)(a^k, t_k, s) * dt
   eps ~ N(0, I)
-  a^K = a^{K-1} + v_base(a^{K-1}, t_{K-1}, s) * dt + sigma_phi(s) * eps
+  a^K = a^{K-1} + (v_base + v_res)(a^{K-1}, t_{K-1}, s) * dt + sigma_phi(s) * eps
 
 Losses
   L_critic = MSE(Q(s, a^K), r + gamma * (1-d) * min Q_target(s', a'^K))   (no entropy term)
@@ -18,6 +18,7 @@ Losses
 """
 import logging
 import copy
+import math
 from typing import Tuple, Dict, Any
 
 import torch
@@ -87,6 +88,7 @@ class SACResidualFlow(nn.Module):
         denoised_clip_value: float = 1.0,
         randn_clip_value: float = 3.0,
         backward_fp_iters: int = 10,
+        alpha: float = 0.1,
         kl_weight: float = 0.05,
         jac_weight: float = 0.01,
         target_ema_rate: float = 0.005,
@@ -105,6 +107,7 @@ class SACResidualFlow(nn.Module):
         self.denoised_clip_value = denoised_clip_value
         self.randn_clip_value = randn_clip_value
         self.backward_fp_iters = backward_fp_iters
+        self.alpha = alpha
         self.kl_weight = kl_weight
         self.jac_weight = jac_weight
         self.target_ema_rate = target_ema_rate
@@ -194,9 +197,8 @@ class SACResidualFlow(nn.Module):
 
         a = torch.randn(B, self.horizon_steps, self.action_dim, device=device)
 
-        # K-1 deterministic steps with v_base + v_res. NO intermediate clamping:
-        # clamping is non-smooth and would break the change-of-variables formula
-        # (the discrete map must remain a diffeomorphism). Jacobian Frobenius reg
+        # K-1 deterministic ODE steps (no exploration noise). NO intermediate clamping:
+        # clamping is non-smooth and breaks change-of-variables; Jacobian Frobenius reg
         # keeps the flow well-conditioned instead.
         for k in range(K - 1):
             t = torch.full((B,), k * dt, device=device)
@@ -205,9 +207,10 @@ class SACResidualFlow(nn.Module):
 
         a_Km1 = a
 
-        # Last step: v_base only + Gaussian
+        # Last step: combined velocity (v_base + v_res) + Gaussian exploration noise.
+        # v_res is active at every step so gradients flow through the full K-step trajectory.
         t_last = torch.full((B,), (K - 1) * dt, device=device)
-        v_b = self.v_base(a_Km1, t_last, cond)
+        v_last = self._combined_velocity(a_Km1, t_last, cond)
         sigma = self.sigma_head(cond["state"])  # (B, Ta, Da)
         if deterministic:
             eps = torch.zeros_like(a_Km1)
@@ -215,7 +218,7 @@ class SACResidualFlow(nn.Module):
             eps = torch.randn_like(a_Km1)
             # safety: bound the realized noise like ReinFlow's randn_clip_value
             eps = eps.clamp(-self.randn_clip_value, self.randn_clip_value)
-        a_K = a_Km1 + v_b * dt + sigma * eps
+        a_K = a_Km1 + v_last * dt + sigma * eps
         a_K = a_K.clamp(self.act_min, self.act_max)
 
         if return_intermediate:
@@ -429,10 +432,10 @@ class SACResidualFlow(nn.Module):
 
         # 4) advance one final noisy step (reparameterized) to get the executed a^K
         t_last = torch.full((B,), (K - 1) * dt, device=device)
-        v_b = self.v_base(a_Km1, t_last, cond)
+        v_last = self._combined_velocity(a_Km1, t_last, cond)
         sigma = self.sigma_head(cond["state"])
         eps = torch.randn_like(a_Km1).clamp(-self.randn_clip_value, self.randn_clip_value)
-        a_K = (a_Km1 + v_b * dt + sigma * eps).clamp(self.act_min, self.act_max)
+        a_K = (a_Km1 + v_last * dt + sigma * eps).clamp(self.act_min, self.act_max)
 
         return a_K, kl, jac_reg
 
@@ -447,23 +450,39 @@ class SACResidualFlow(nn.Module):
         return F.mse_loss(q1, target) + F.mse_loss(q2, target)
 
     def loss_actor(self, obs):
-        """Returns total actor-side loss and an info dict.
+        """SAC actor loss with standard entropy bonus.
 
-        L = -min(Q1, Q2)(s, a^K)  +  beta * KL  +  lambda_J * jac_reg
+        L = -min(Q1, Q2)(s, a^K)  +  alpha * log pi(a^K | s)
+
+        Entropy is approximated via the final Gaussian step:
+            log pi(a^K | s) = -0.5*eps^2 - log(sigma) - 0.5*log(2*pi)  per dim
+        where eps is the noise drawn at the last ODE step.
+
+        NOTE: KL-based regularizer (compute_kl_and_action) is preserved below and
+        will replace this once partner's KL implementation is integrated.
         """
-        a_K, kl, jac_reg = self.compute_kl_and_action(obs)
+        a_K, a_Km1, eps = self.sample_action(obs, return_intermediate=True)
+
         q1, q2 = self.critic(obs, a_K)
         q_min = torch.min(q1, q2)
         sac_loss = -q_min.mean()
-        kl_loss = kl.mean()
-        total = sac_loss + self.kl_weight * kl_loss + self.jac_weight * jac_reg
+
+        # entropy bonus from final Gaussian step
+        sigma = self.sigma_head(obs["state"])  # (B, Ta, Da)
+        log_prob = (
+            -0.5 * eps.pow(2) - sigma.log() - 0.5 * math.log(2.0 * math.pi)
+        ).sum(dim=(-2, -1))  # (B,)
+        entropy_loss = self.alpha * log_prob.mean()
+
+        total = sac_loss + entropy_loss
 
         info = {
             "loss_actor_sac": sac_loss.item(),
-            "loss_kl": kl_loss.item(),
-            "loss_jac": jac_reg.item() if torch.is_tensor(jac_reg) else float(jac_reg),
+            "loss_entropy": entropy_loss.item(),
+            "entropy": -log_prob.mean().item(),
             "q_mean": q_min.mean().item(),
-            "kl_max": kl.max().item(),
-            "kl_min": kl.min().item(),
+            "sigma_mean": sigma.mean().item(),
+            "sigma_min": sigma.min().item(),
+            "sigma_max": sigma.max().item(),
         }
         return total, info

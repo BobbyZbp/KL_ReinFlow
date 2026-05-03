@@ -75,9 +75,10 @@ train:
     num: 0
   reward_scale_running: false        # off-policy: do not running-normalize rewards
   reward_scale_const: 1.0
-  # KL/jac weights override the model defaults if set here
-  kl_weight: 0.05
-  jac_weight: 0.01
+  alpha: 0.1                         # SAC entropy temperature (standard entropy bonus)
+  # kl_weight and jac_weight reserved for partner's KL integration
+  # kl_weight: 0.05
+  # jac_weight: 0.01
   verbose: false
 
 model:
