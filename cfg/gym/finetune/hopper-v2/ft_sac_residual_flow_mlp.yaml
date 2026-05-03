@@ -65,7 +65,7 @@ train:
   batch_size: 256
   buffer_size: 1000000
   n_eval_episode: 40
-  n_explore_steps: 5000
+  n_explore_steps: 1000               # reduced: base policy already well-performing
   critic_replay_ratio: 256           # update_freq = batch_size / replay_ratio = 256/256 = 1 (every iter)
   actor_replay_ratio: 128            # update_freq = 256/128 = 2 (delayed actor, every 2 iters)
   save_model_freq: 5000
@@ -75,10 +75,11 @@ train:
     num: 0
   reward_scale_running: false        # off-policy: do not running-normalize rewards
   reward_scale_const: 1.0
-  alpha: 0.1                         # SAC entropy temperature (standard entropy bonus)
-  # kl_weight and jac_weight reserved for partner's KL integration
-  # kl_weight: 0.05
-  # jac_weight: 0.01
+  alpha: 0.0                          # entropy bonus disabled (using exact KL instead)
+  kl_weight: 0.05                     # weight on KL(theta || base) via change of variables
+  jac_weight: 0.01                    # weight on ||J_res||_F^2 Frobenius regularizer
+  sigma_entropy_weight: 0.01          # weight on -log(sigma) entropy bonus for exploration noise
+  critic_warmup_iters: 2000           # critic-only training before actor updates begin
   verbose: false
 
 model:

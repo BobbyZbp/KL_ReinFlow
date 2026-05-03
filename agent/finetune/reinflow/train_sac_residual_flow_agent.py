@@ -56,13 +56,15 @@ class TrainSACResidualFlowAgent(TrainAgent):
         self.n_eval_episode = cfg.train.n_eval_episode
         self.n_explore_steps = cfg.train.n_explore_steps
 
-        # entropy temperature (standard SAC); KL weights kept for partner's integration later
         self.alpha = cfg.train.get("alpha", self.model.alpha)
         self.model.alpha = self.alpha
         self.kl_weight = cfg.train.get("kl_weight", self.model.kl_weight)
         self.jac_weight = cfg.train.get("jac_weight", self.model.jac_weight)
+        self.sigma_entropy_weight = cfg.train.get("sigma_entropy_weight", self.model.sigma_entropy_weight)
         self.model.kl_weight = self.kl_weight
         self.model.jac_weight = self.jac_weight
+        self.model.sigma_entropy_weight = self.sigma_entropy_weight
+        self.critic_warmup_iters = cfg.train.get("critic_warmup_iters", 0)
 
         # n_steps per outer iteration is set by parent TrainAgent.__init__ from cfg.train.n_steps.
         # Default to 1 to mimic standard SAC if parent didn't set it.
@@ -73,7 +75,8 @@ class TrainSACResidualFlowAgent(TrainAgent):
             f"SACResidualFlow trainer: gamma={self.gamma} tau={self.target_ema_rate} "
             f"batch={self.batch_size} critic_freq={self.critic_update_freq} "
             f"actor_freq={self.actor_update_freq} explore_steps={self.n_explore_steps} "
-            f"alpha={self.alpha} (entropy SAC; KL integration pending)"
+            f"alpha={self.alpha} kl_w={self.kl_weight} jac_w={self.jac_weight} "
+            f"sigma_ent_w={self.sigma_entropy_weight} critic_warmup={self.critic_warmup_iters}"
         )
 
     # ----------------------------------------------------------------- run
@@ -261,8 +264,9 @@ class TrainSACResidualFlowAgent(TrainAgent):
                 self.model.update_target_critic(self.target_ema_rate)
                 loss_critic_val = loss_critic.item()
 
-                # ---- actor step (delayed)
-                if self.itr % self.actor_update_freq == 0:
+                # ---- actor step (delayed; skipped during critic warmup)
+                past_warmup = self.itr >= self.n_explore_steps + self.critic_warmup_iters
+                if past_warmup and self.itr % self.actor_update_freq == 0:
                     loss_actor, last_actor_info = self.model.loss_actor(obs_dict)
                     self.actor_optimizer.zero_grad()
                     loss_actor.backward()

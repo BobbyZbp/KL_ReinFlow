@@ -248,7 +248,7 @@ class PreTrainAgent:
                 self.env_name,
                 env_type=env_type,
                 num_envs=self.env_config.n_envs,
-                asynchronous=True,
+                asynchronous=cfg.env.get("asynchronous", False),
                 max_episode_steps=self.env_config.max_episode_steps,
                 wrappers=self.env_config.wrappers,
                 robomimic_env_cfg_path=self.env_config.robomimic_env_cfg_path,

@@ -18,8 +18,7 @@ Losses
 """
 import logging
 import copy
-import math
-from typing import Tuple, Dict, Any
+from typing import Dict
 
 import torch
 from torch import nn, Tensor
@@ -91,6 +90,7 @@ class SACResidualFlow(nn.Module):
         alpha: float = 0.1,
         kl_weight: float = 0.05,
         jac_weight: float = 0.01,
+        sigma_entropy_weight: float = 0.01,
         target_ema_rate: float = 0.005,
         zero_init_residual: bool = True,
     ):
@@ -110,6 +110,7 @@ class SACResidualFlow(nn.Module):
         self.alpha = alpha
         self.kl_weight = kl_weight
         self.jac_weight = jac_weight
+        self.sigma_entropy_weight = sigma_entropy_weight
         self.target_ema_rate = target_ema_rate
 
         # frozen base
@@ -371,9 +372,11 @@ class SACResidualFlow(nn.Module):
             traj_a.insert(0, a_prev)
             a_next = a_prev
 
-        # log p_0 at a^0_base
+        # log p_0 at a^0_base  (manual Gaussian to avoid Normal's finite-value check;
+        # FP inversion can diverge on out-of-distribution samples)
         a0 = traj_a[0]
-        log_p0 = Normal(torch.zeros_like(a0), 1.0).log_prob(a0).sum(dim=(-2, -1))
+        log_p0_elementwise = -0.5 * (a0 ** 2 + 1.8378770664093453)  # log(2*pi)
+        log_p0 = torch.nan_to_num(log_p0_elementwise, nan=0.0, posinf=0.0, neginf=-1e4).sum(dim=(-2, -1))
 
         # Forward base log-dets evaluated at the recovered base trajectory
         sum_logdet = torch.zeros(B, device=device)
@@ -450,36 +453,33 @@ class SACResidualFlow(nn.Module):
         return F.mse_loss(q1, target) + F.mse_loss(q2, target)
 
     def loss_actor(self, obs):
-        """SAC actor loss with standard entropy bonus.
+        """SAC actor loss with exact KL regularizer and sigma entropy bonus.
 
-        L = -min(Q1, Q2)(s, a^K)  +  alpha * log pi(a^K | s)
-
-        Entropy is approximated via the final Gaussian step:
-            log pi(a^K | s) = -0.5*eps^2 - log(sigma) - 0.5*log(2*pi)  per dim
-        where eps is the noise drawn at the last ODE step.
-
-        NOTE: KL-based regularizer (compute_kl_and_action) is preserved below and
-        will replace this once partner's KL implementation is integrated.
+        L = -min(Q1,Q2)(s,a^K) + kl_w*KL + jac_w*||J_res||^2 - sigma_ent_w*log(sigma)
         """
-        a_K, a_Km1, eps = self.sample_action(obs, return_intermediate=True)
+        a_K, kl, jac_reg = self.compute_kl_and_action(obs)
 
         q1, q2 = self.critic(obs, a_K)
         q_min = torch.min(q1, q2)
         sac_loss = -q_min.mean()
 
-        # entropy bonus from final Gaussian step
-        sigma = self.sigma_head(obs["state"])  # (B, Ta, Da)
-        log_prob = (
-            -0.5 * eps.pow(2) - sigma.log() - 0.5 * math.log(2.0 * math.pi)
-        ).sum(dim=(-2, -1))  # (B,)
-        entropy_loss = self.alpha * log_prob.mean()
+        kl_loss = self.kl_weight * kl.mean()
+        jac_loss = self.jac_weight * jac_reg
 
-        total = sac_loss + entropy_loss
+        sigma = self.sigma_head(obs["state"])
+        sigma_entropy = sigma.log().sum(dim=(-2, -1)).mean()
+        sigma_ent_loss = -self.sigma_entropy_weight * sigma_entropy
+
+        total = sac_loss + kl_loss + jac_loss + sigma_ent_loss
 
         info = {
-            "loss_actor_sac": sac_loss.item(),
-            "loss_entropy": entropy_loss.item(),
-            "entropy": -log_prob.mean().item(),
+            "loss_sac": sac_loss.item(),
+            "loss_kl": kl_loss.item(),
+            "loss_jac": jac_loss.item(),
+            "loss_sigma_ent": sigma_ent_loss.item(),
+            "kl_mean": kl.mean().item(),
+            "kl_std": kl.std().item(),
+            "kl_max": kl.max().item(),
             "q_mean": q_min.mean().item(),
             "sigma_mean": sigma.mean().item(),
             "sigma_min": sigma.min().item(),
