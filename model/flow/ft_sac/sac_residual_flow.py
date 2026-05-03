@@ -194,12 +194,14 @@ class SACResidualFlow(nn.Module):
 
         a = torch.randn(B, self.horizon_steps, self.action_dim, device=device)
 
-        # K-1 deterministic steps with v_base + v_res
+        # K-1 deterministic steps with v_base + v_res. NO intermediate clamping:
+        # clamping is non-smooth and would break the change-of-variables formula
+        # (the discrete map must remain a diffeomorphism). Jacobian Frobenius reg
+        # keeps the flow well-conditioned instead.
         for k in range(K - 1):
             t = torch.full((B,), k * dt, device=device)
             v = self._combined_velocity(a, t, cond)
             a = a + v * dt
-            a = a.clamp(-self.denoised_clip_value, self.denoised_clip_value)
 
         a_Km1 = a
 
@@ -284,10 +286,10 @@ class SACResidualFlow(nn.Module):
             # We still proceed but log it.
             sum_logdet = sum_logdet + logabsdet
 
-            # Advance state
+            # Advance state. NO intermediate clamping (would break the change of variables;
+            # see sample_action note).
             v = self._combined_velocity(a, t, cond)
             a = a + v * dt
-            a = a.clamp(-self.denoised_clip_value, self.denoised_clip_value)
 
         log_p = log_p0 - sum_logdet
         return a, log_p, traj_a, traj_t
