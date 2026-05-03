@@ -54,7 +54,9 @@ wandb:
 train:
   n_train_itr: 200000
   n_critic_warmup_itr: 0
-  n_steps_per_iter: 1                # env steps per outer iter (1 = standard SAC cadence)
+  n_steps: 1                          # env steps per outer iter (parent TrainAgent reads this)
+  force_train: false
+  log_freq: 1
   gamma: 0.99
   actor_lr: 3.0e-5                   # small, to avoid destabilizing the ODE (per idea doc)
   critic_lr: 3.0e-4

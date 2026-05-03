@@ -61,9 +61,10 @@ class TrainSACResidualFlowAgent(TrainAgent):
         self.model.kl_weight = self.kl_weight
         self.model.jac_weight = self.jac_weight
 
-        # n_steps per outer iteration (env steps before the next round of updates)
-        # Set to 1 to mimic standard SAC; larger values batch env steps before updating.
-        self.n_steps = cfg.train.get("n_steps_per_iter", 1)
+        # n_steps per outer iteration is set by parent TrainAgent.__init__ from cfg.train.n_steps.
+        # Default to 1 to mimic standard SAC if parent didn't set it.
+        if not hasattr(self, "n_steps"):
+            self.n_steps = cfg.train.get("n_steps", 1)
 
         log.info(
             f"SACResidualFlow trainer: gamma={self.gamma} tau={self.target_ema_rate} "
