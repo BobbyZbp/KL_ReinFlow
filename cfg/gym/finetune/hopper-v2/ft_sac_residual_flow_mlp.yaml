@@ -133,7 +133,7 @@ model:
   inference_steps: ${denoising_steps}
   denoised_clip_value: 1.0
   randn_clip_value: 3.0
-  backward_fp_iters: 10              # per pi0.5 verification: ~0.15% logprob agreement
+  backward_fp_iters: 30              # bumped from 10 — trained flows are stiffer, need more FP iters
   kl_weight: 0.05
   jac_weight: 0.01
   target_ema_rate: 0.005

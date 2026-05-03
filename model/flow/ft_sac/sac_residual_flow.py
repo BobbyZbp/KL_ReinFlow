@@ -392,7 +392,7 @@ class SACResidualFlow(nn.Module):
 
         Returns:
             a_K        : (B, Ta, Da), reparameterized through ODE + final Gaussian
-            kl         : (B,)
+            kl         : (B,)        clamped to a sane range to defend against FP non-convergence
             jac_reg    : scalar
         """
         B = cond["state"].shape[0]
@@ -407,7 +407,14 @@ class SACResidualFlow(nn.Module):
         # 2) backward base from a^{K-1}_theta -> log p_base
         log_p_base = self.backward_base_logprob(a_Km1, cond)
 
-        kl = log_p_theta - log_p_base
+        kl_raw = log_p_theta - log_p_base
+
+        # Defense against backward-FP non-convergence on stiff trained flows:
+        # - clamp per-sample KL to a sane range (anything beyond ~50 nats is numerical garbage,
+        #   not real divergence — a 50-nat KL already means probability ratio of e^50)
+        # - replace NaN/Inf with 0 so they don't contaminate gradients
+        kl = torch.nan_to_num(kl_raw, nan=0.0, posinf=50.0, neginf=-50.0)
+        kl = kl.clamp(-50.0, 50.0)
 
         # 3) Jacobian Frobenius reg on v_res only, along forward trajectory
         jac_reg = a_Km1.new_zeros(())
