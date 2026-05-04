@@ -275,8 +275,37 @@ class TrainSACResidualFlowAgent(TrainAgent):
                 past_warmup = self.itr >= self.n_explore_steps + self.critic_warmup_iters
                 if past_warmup and self.itr % self.actor_update_freq == 0:
                     loss_actor, last_actor_info = self.model.loss_actor(obs_dict)
+
+                    # === DIAGNOSTIC: pre-backward NaN sentinel ===
+                    # Check every component of the actor loss BEFORE backward, so we know
+                    # whether NaN entered through KL, Jacobian reg, sigma entropy, or Q.
+                    bad = []
+                    for k, v in last_actor_info.items():
+                        if isinstance(v, float) and (v != v or abs(v) == float("inf")):
+                            bad.append(f"{k}={v}")
+                    if bad:
+                        log.error(f"[NaN SENTINEL] iter={self.itr} actor_info has bad values: {bad}")
+                        log.error(f"[NaN SENTINEL] full actor_info: {last_actor_info}")
+                        raise RuntimeError(f"Actor loss component NaN/Inf at iter {self.itr}: {bad}")
+
                     self.actor_optimizer.zero_grad()
                     loss_actor.backward()
+
+                    # === DIAGNOSTIC: pre-step gradient NaN sentinel ===
+                    # Check that no gradient is NaN/Inf BEFORE optimizer.step() corrupts params.
+                    bad_grads = []
+                    for name, p in list(self.model.v_res.named_parameters()) + \
+                                    [(f"sigma_head.{n}", q) for n, q in self.model.sigma_head.named_parameters()]:
+                        if p.grad is not None:
+                            if torch.isnan(p.grad).any():
+                                bad_grads.append(f"{name}:nan")
+                            elif torch.isinf(p.grad).any():
+                                bad_grads.append(f"{name}:inf")
+                    if bad_grads:
+                        log.error(f"[NaN SENTINEL] iter={self.itr} grads have NaN/Inf BEFORE step: {bad_grads[:5]}")
+                        log.error(f"[NaN SENTINEL] actor_info at this iter: {last_actor_info}")
+                        raise RuntimeError(f"Actor gradient NaN/Inf at iter {self.itr}: {bad_grads[:5]}")
+
                     actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                         list(self.model.v_res.parameters()) + list(self.model.sigma_head.parameters()),
                         max_norm=1.0,
