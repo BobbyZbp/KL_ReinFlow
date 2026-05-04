@@ -1,0 +1,146 @@
+######################################################################
+# SAC fine-tuning of a flow-matching policy with a residual velocity
+# head + exact deterministic KL via change of variables (replaces PPO).
+######################################################################
+env_name: hopper-medium-v2
+action_dim: 3
+horizon_steps: 4
+act_steps: 4
+obs_dim: 11
+cond_steps: 1
+######################################################################
+
+defaults:
+  - _self_
+hydra:
+  run:
+    dir: ${logdir}
+_target_: agent.finetune.reinflow.train_sac_residual_flow_agent.TrainSACResidualFlowAgent
+name: ${env_name}_sac_resflow_mlp_debug_ta${horizon_steps}_td${denoising_steps}
+logdir: ${oc.env:REINFLOW_LOG_DIR}/gym/finetune/${env_name}_sac_resflow_mlp_ta${horizon_steps}_td${denoising_steps}/${now:%Y-%m-%d}_${now:%H-%M-%S}_seed${seed}
+base_policy_path: ${oc.env:REINFLOW_LOG_DIR}/gym/pretrain/hopper-v2/ReFlow/2025-02-06_01-35-03_D4RL_42/state_40.pt
+normalization_path: ${oc.env:REINFLOW_DATA_DIR}/gym/${env_name}/normalization.npz
+resume_path: null
+seed: 42
+device: cuda:0
+sim_device: cuda:0
+
+denoising_steps: 4         # K. Steps 0..K-2 are deterministic (residual active); step K-1 is noisy (base only).
+sigma_min: 0.05
+sigma_max: 0.15
+
+env:
+  n_envs: 40
+  name: ${env_name}
+  max_episode_steps: 1000
+  reset_at_iteration: false
+  save_video: false
+  best_reward_threshold_for_success: 3
+  wrappers:
+    mujoco_locomotion_lowdim:
+      normalization_path: ${normalization_path}
+    multi_step:
+      n_obs_steps: ${cond_steps}
+      n_action_steps: ${act_steps}
+      max_episode_steps: ${env.max_episode_steps}
+      reset_within_step: true
+
+wandb:
+  entity: ${oc.env:REINFLOW_WANDB_ENTITY}
+  project: gym-${env_name}-finetune
+  run: ${now:%Y-%m-%d}_${now:%H-%M-%S}_${name}
+  offline_mode: false
+
+train:
+  n_train_itr: 200000
+  n_critic_warmup_itr: 0
+  n_steps: 1                          # env steps per outer iter (parent TrainAgent reads this)
+  force_train: false
+  log_freq: 1
+  gamma: 0.99
+  actor_lr: 3.0e-5                   # small, to avoid destabilizing the ODE (per idea doc)
+  critic_lr: 3.0e-4
+  target_ema_rate: 0.005
+  scale_reward_factor: 1.0
+  batch_size: 256
+  buffer_size: 1000000
+  n_eval_episode: 40
+  n_explore_steps: 1000               # reduced: base policy already well-performing
+  critic_replay_ratio: 256           # update_freq = batch_size / replay_ratio = 256/256 = 1 (every iter)
+  actor_replay_ratio: 64             # update_freq = 256/64 = 4 (delayed actor, every 4 iters)
+  save_model_freq: 5000
+  val_freq: 5000
+  render:
+    freq: 1
+    num: 0
+  reward_scale_running: false        # off-policy: do not running-normalize rewards
+  reward_scale_const: 1.0
+  alpha: 0.0                          # unused in flow actor loss (no tractable log_prob)
+  kl_weight: 0.05                     # weight on KL(theta || base) via change of variables
+  jac_weight: 0.01                    # weight on ||J_res||_F^2 Frobenius regularizer
+  sigma_entropy_weight: 0.1           # proxy entropy via Gaussian noise head (was 0.01, matching release alpha scale)
+  critic_warmup_iters: 5000           # critic-only training before actor updates begin
+  verbose: false
+
+model:
+  _target_: model.flow.ft_sac.sac_residual_flow_debug.SACResidualFlow
+  device: ${device}
+  base_policy:
+    _target_: model.flow.mlp_flow.FlowMLP
+    horizon_steps: ${horizon_steps}
+    action_dim: ${action_dim}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    time_dim: 16
+    mlp_dims: [512, 512, 512]
+    activation_type: ReLU
+    out_activation_type: Identity
+    use_layernorm: false
+    residual_style: true
+  residual_policy:
+    _target_: model.flow.mlp_flow.FlowMLP
+    horizon_steps: ${horizon_steps}
+    action_dim: ${action_dim}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    time_dim: 16
+    mlp_dims: [128, 128]            # small residual head
+    activation_type: ReLU
+    out_activation_type: Identity
+    use_layernorm: false
+    residual_style: false
+  critic:
+    _target_: model.common.critic.CriticObsAct
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    mlp_dims: [256, 256, 256]
+    action_dim: ${action_dim}
+    action_steps: ${horizon_steps}
+    activation_type: Mish
+    use_layernorm: true
+    residual_tyle: false
+    double_q: true
+  sigma_head:
+    _target_: model.flow.ft_sac.sac_residual_flow.SigmaHead
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    action_dim: ${action_dim}
+    horizon_steps: ${horizon_steps}
+    hidden_dims: [64, 64]
+    sigma_min: ${sigma_min}
+    sigma_max: ${sigma_max}
+  actor_policy_path: ${base_policy_path}
+  act_dim: ${action_dim}
+  horizon_steps: ${horizon_steps}
+  act_min: -1
+  act_max: 1
+  obs_dim: ${obs_dim}
+  cond_steps: ${cond_steps}
+  inference_steps: ${denoising_steps}
+  denoised_clip_value: 1.0
+  randn_clip_value: 3.0
+  backward_fp_iters: 30              # bumped from 10 — trained flows are stiffer, need more FP iters
+  alpha: 0.0
+  kl_weight: 0.05
+  jac_weight: 0.01
+  sigma_entropy_weight: 0.1
+  target_ema_rate: 0.005
+  zero_init_residual: true
+  use_hutchinson: true               # DEBUG: Hutchinson trace estimator instead of slogdet
+  hutchinson_n_samples: 1
