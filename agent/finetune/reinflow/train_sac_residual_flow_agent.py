@@ -66,27 +66,82 @@ class TrainSACResidualFlowAgent(TrainAgent):
         self.model.sigma_entropy_weight = self.sigma_entropy_weight
         self.critic_warmup_iters = cfg.train.get("critic_warmup_iters", 0)
 
+        self.kl_mode = cfg.train.get("kl_mode", "none")
+        self.model.kl_mode = self.kl_mode
+        self.kl_reward_weight = cfg.train.get("kl_reward_weight", 0.0)
+        self.vres_l2_weight = cfg.train.get("vres_l2_weight", 0.0)
+        self.model.vres_l2_weight = self.vres_l2_weight
+        self.hutchinson_samples = cfg.train.get("hutchinson_samples", 1)
+        self.model.hutchinson_samples = self.hutchinson_samples
+
         # n_steps per outer iteration is set by parent TrainAgent.__init__ from cfg.train.n_steps.
         # Default to 1 to mimic standard SAC if parent didn't set it.
         if not hasattr(self, "n_steps"):
             self.n_steps = cfg.train.get("n_steps", 1)
+
+        self.resume_path = cfg.get("resume_path", None)
 
         log.info(
             f"SACResidualFlow trainer: gamma={self.gamma} tau={self.target_ema_rate} "
             f"batch={self.batch_size} critic_freq={self.critic_update_freq} "
             f"actor_freq={self.actor_update_freq} explore_steps={self.n_explore_steps} "
             f"alpha={self.alpha} kl_w={self.kl_weight} jac_w={self.jac_weight} "
-            f"sigma_ent_w={self.sigma_entropy_weight} critic_warmup={self.critic_warmup_iters}"
+            f"sigma_ent_w={self.sigma_entropy_weight} critic_warmup={self.critic_warmup_iters} "
+            f"kl_mode={self.kl_mode} kl_reward_w={self.kl_reward_weight} "
+            f"vres_l2_w={self.vres_l2_weight}"
         )
+
+    # ----------------------------------------------------------- checkpointing
+    def save_checkpoint(self, replay_buffers=None):
+        data = {
+            "itr": self.itr,
+            "model": self.model.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+        }
+        if replay_buffers is not None:
+            data["replay"] = {
+                k: list(v) for k, v in replay_buffers.items()
+            }
+        path = os.path.join(self.checkpoint_dir, f"state_{self.itr}.pt")
+        torch.save(data, path)
+        latest = os.path.join(self.checkpoint_dir, "latest.pt")
+        torch.save(data, latest)
+        log.info(f"Saved checkpoint to {path}")
+
+    def load_checkpoint(self, path):
+        log.info(f"Resuming from {path}")
+        data = torch.load(path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(data["model"])
+        if "actor_optimizer" in data:
+            self.actor_optimizer.load_state_dict(data["actor_optimizer"])
+        if "critic_optimizer" in data:
+            self.critic_optimizer.load_state_dict(data["critic_optimizer"])
+        self.itr = data["itr"] + 1
+        self._resumed_replay = data.get("replay", None)
+        log.info(f"Resumed at itr={self.itr} (replay={'yes' if self._resumed_replay else 'no'})")
 
     # ----------------------------------------------------------------- run
     def run(self):
+        if self.resume_path and os.path.isfile(self.resume_path):
+            self.load_checkpoint(self.resume_path)
+
         # FIFO replay buffers
         obs_buffer = deque(maxlen=self.buffer_size)
         next_obs_buffer = deque(maxlen=self.buffer_size)
         action_buffer = deque(maxlen=self.buffer_size)
         reward_buffer = deque(maxlen=self.buffer_size)
         terminated_buffer = deque(maxlen=self.buffer_size)
+
+        if hasattr(self, "_resumed_replay") and self._resumed_replay is not None:
+            r = self._resumed_replay
+            obs_buffer.extend(r["obs"])
+            next_obs_buffer.extend(r["next_obs"])
+            action_buffer.extend(r["action"])
+            reward_buffer.extend(r["reward"])
+            terminated_buffer.extend(r["terminated"])
+            log.info(f"Restored replay buffer with {len(obs_buffer)} transitions")
+            del self._resumed_replay
 
         # Running per-env episode reward accumulators + finished-episode log.
         # n_steps=1 means each iter only sees 1 env step, so we must accumulate
@@ -95,6 +150,9 @@ class TrainSACResidualFlowAgent(TrainAgent):
         ep_running_len = np.zeros(self.n_envs, dtype=np.int64)
         completed_ep_rewards = deque(maxlen=200)
         completed_ep_lens = deque(maxlen=200)
+        recent_kl_penalties = deque(maxlen=200)
+        recent_raw_rewards = deque(maxlen=200)
+        recent_modified_rewards = deque(maxlen=200)
 
         timer = Timer()
         run_results = []
@@ -159,6 +217,19 @@ class TrainSACResidualFlowAgent(TrainAgent):
                 firsts_trajs[step + 1] = done_venv
 
                 if not eval_mode:
+                    kl_penalty_np = np.zeros(self.n_envs)
+                    if (
+                        self.kl_mode == "reward_penalty"
+                        and self.kl_reward_weight > 0
+                        and self.itr >= self.n_explore_steps
+                    ):
+                        with torch.no_grad():
+                            cond_kl = {
+                                "state": torch.from_numpy(prev_obs_venv["state"]).float().to(self.device)
+                            }
+                            kl_vals = self.model.compute_kl_for_reward(cond_kl)
+                            kl_penalty_np = kl_vals.cpu().numpy()
+
                     for i in range(self.n_envs):
                         s_prev = prev_obs_venv["state"][i]
                         if "final_obs" in info_venv[i]:
@@ -170,8 +241,14 @@ class TrainSACResidualFlowAgent(TrainAgent):
                         obs_buffer.append(s_prev)
                         next_obs_buffer.append(s_next)
                         action_buffer.append(action_venv[i])
-                        reward_buffer.append(float(reward_venv[i] * self.scale_reward_factor))
+                        r_raw = float(reward_venv[i] * self.scale_reward_factor)
+                        kl_pen = self.kl_reward_weight * float(kl_penalty_np[i])
+                        r_modified = r_raw - kl_pen
+                        reward_buffer.append(r_modified)
                         terminated_buffer.append(float(terminated_venv[i]))
+                        recent_raw_rewards.append(r_raw)
+                        recent_modified_rewards.append(r_modified)
+                        recent_kl_penalties.append(kl_pen)
 
                     # Running episode reward / length, accumulated across iters.
                     # Flush to completed_* deques whenever an env terminates or truncates.
@@ -263,34 +340,54 @@ class TrainSACResidualFlowAgent(TrainAgent):
                 loss_critic, last_critic_info = self.model.loss_critic(
                     obs_dict, next_obs_dict, actions_b, rewards_b, terminated_b, self.gamma
                 )
-                self.critic_optimizer.zero_grad()
-                loss_critic.backward()
-                critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), max_norm=10.0)
-                self.critic_optimizer.step()
-                self.model.update_target_critic(self.target_ema_rate)
+                if not torch.isfinite(loss_critic):
+                    log.error(f"iter {self.itr}: critic loss is {loss_critic.item()}, skipping update")
+                    log.error(f"  critic info: {last_critic_info}")
+                    log.error(f"  rewards_b: min={rewards_b.min():.4f} max={rewards_b.max():.4f} "
+                              f"has_nan={torch.isnan(rewards_b).any()}")
+                else:
+                    self.critic_optimizer.zero_grad()
+                    loss_critic.backward()
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), max_norm=10.0)
+                    self.critic_optimizer.step()
+                    self.model.update_target_critic(self.target_ema_rate)
+                    last_critic_info["grad_norm"] = critic_grad_norm.item()
                 loss_critic_val = loss_critic.item()
-                last_critic_info["grad_norm"] = critic_grad_norm.item()
 
                 # ---- actor step (delayed; skipped during critic warmup)
                 past_warmup = self.itr >= self.n_explore_steps + self.critic_warmup_iters
                 if past_warmup and self.itr % self.actor_update_freq == 0:
                     loss_actor, last_actor_info = self.model.loss_actor(obs_dict)
-                    self.actor_optimizer.zero_grad()
-                    loss_actor.backward()
-                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                        list(self.model.v_res.parameters()) + list(self.model.sigma_head.parameters()),
-                        max_norm=1.0,
-                    )
-                    self.actor_optimizer.step()
+                    if not torch.isfinite(loss_actor):
+                        log.error(f"iter {self.itr}: actor loss is {loss_actor.item()}, skipping update")
+                        log.error(f"  actor info: {last_actor_info}")
+                        nan_components = {k: v for k, v in last_actor_info.items()
+                                          if isinstance(v, float) and (v != v or abs(v) > 1e15)}
+                        if nan_components:
+                            log.error(f"  NaN/huge components: {nan_components}")
+                    else:
+                        self.actor_optimizer.zero_grad()
+                        loss_actor.backward()
+                        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            list(self.model.v_res.parameters()) + list(self.model.sigma_head.parameters()),
+                            max_norm=1.0,
+                        )
+                        self.actor_optimizer.step()
+                        last_actor_info["grad_norm"] = actor_grad_norm.item()
                     loss_actor_val = loss_actor.item()
-                    last_actor_info["grad_norm"] = actor_grad_norm.item()
                     with torch.no_grad():
                         vres_norm = sum(p.norm().item()**2 for p in self.model.v_res.parameters())**0.5
                     last_actor_info["v_res_param_norm"] = vres_norm
 
-            # save model
+            # save checkpoint (model + optimizers + replay buffer for resume)
             if self.itr % self.save_model_freq == 0 or self.itr == self.n_train_itr - 1:
-                self.save_model()
+                self.save_checkpoint(replay_buffers={
+                    "obs": obs_buffer,
+                    "next_obs": next_obs_buffer,
+                    "action": action_buffer,
+                    "reward": reward_buffer,
+                    "terminated": terminated_buffer,
+                })
 
             # log
             run_results.append({"itr": self.itr, "step": cnt_train_step})
@@ -337,6 +434,10 @@ class TrainSACResidualFlowAgent(TrainAgent):
                             wandb_log_dict["episode/reward_max"] = float(np.max(completed_ep_rewards))
                             wandb_log_dict["episode/reward_min"] = float(np.min(completed_ep_rewards))
                             wandb_log_dict["episode/length_mean"] = float(np.mean(completed_ep_lens))
+                        if len(recent_raw_rewards) > 0:
+                            wandb_log_dict["reward/raw_mean"] = float(np.mean(recent_raw_rewards))
+                            wandb_log_dict["reward/modified_mean"] = float(np.mean(recent_modified_rewards))
+                            wandb_log_dict["reward/kl_penalty_mean"] = float(np.mean(recent_kl_penalties))
                         wandb.log(wandb_log_dict, step=self.itr, commit=True)
                     run_results[-1]["train_episode_reward"] = avg_episode_reward
                 with open(self.result_path, "wb") as f:
