@@ -95,6 +95,8 @@ class SACResidualFlow(nn.Module):
         zero_init_residual: bool = True,
         use_hutchinson: bool = True,        # DEBUG: replace slogdet with Hutchinson trace estimator
         hutchinson_n_samples: int = 1,      # number of v draws per step
+        use_spectral_norm: bool = True,     # DEBUG: hard Lipschitz cap on v_res via spectral_norm wrappers
+        spectral_norm_n_iters: int = 1,     # power iterations per forward (1 = standard SN-GAN setting)
     ):
         super().__init__()
         self.device = device
@@ -116,6 +118,8 @@ class SACResidualFlow(nn.Module):
         self.target_ema_rate = target_ema_rate
         self.use_hutchinson = use_hutchinson
         self.hutchinson_n_samples = hutchinson_n_samples
+        self.use_spectral_norm = use_spectral_norm
+        self.spectral_norm_n_iters = spectral_norm_n_iters
 
         # frozen base
         self.v_base: FlowMLP = base_policy.to(device)
@@ -126,8 +130,19 @@ class SACResidualFlow(nn.Module):
 
         # trainable residual (initialize to zero so we start from base policy behavior)
         self.v_res: FlowMLP = residual_policy.to(device)
+        if self.use_spectral_norm:
+            # Hard Lipschitz cap: wrap every nn.Linear in v_res with spectral_norm.
+            # This bounds the largest singular value of each weight matrix to 1, so the
+            # whole v_res network is 1-Lipschitz (ReLU/Mish are also 1-Lipschitz).
+            # Therefore ||J_res||_2 <= 1 globally -> forward Jacobian I + (J_base + J_res)*dt
+            # stays well-conditioned regardless of where v_res params drift to during RL training.
+            self._apply_spectral_norm(self.v_res, n_iters=self.spectral_norm_n_iters)
         if zero_init_residual:
-            self._zero_init_velocity_head(self.v_res)
+            # zero the last linear layer's bias so initial v_res output is small.
+            # Note: when spectral_norm is on, the weight is reparametrized (weight_orig + power
+            # iteration vectors), so we cannot directly zero it; we just zero the bias.
+            # The spectral_norm cap (Lipschitz<=1) already ensures the weight cannot blow up.
+            self._zero_init_velocity_head(self.v_res, zero_weight=not self.use_spectral_norm)
 
         # twin critic + targets
         self.critic = critic.to(device)
@@ -153,14 +168,46 @@ class SACResidualFlow(nn.Module):
         log.info(f"Loaded base policy ({key}).")
 
     @staticmethod
-    def _zero_init_velocity_head(flow: FlowMLP):
-        """Zero the last linear layer of the velocity head so v_res(a, t, s) ~= 0 at init."""
+    def _zero_init_velocity_head(flow: FlowMLP, zero_weight: bool = True):
+        """Zero the last linear layer of the velocity head so v_res output is small at init.
+
+        When zero_weight=True (default): zeros both weight and bias of the last Linear.
+        When zero_weight=False: zeros only the bias. Use this when the layer has been
+        wrapped with spectral_norm (which reparametrizes the weight via power iteration);
+        zeroing weight_orig still doesn't make sense and breaks SN's normalization.
+        """
         for m in reversed(list(flow.mlp_mean.modules())):
             if isinstance(m, nn.Linear):
-                nn.init.zeros_(m.weight)
+                if zero_weight:
+                    nn.init.zeros_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
                 break
+
+    @staticmethod
+    def _apply_spectral_norm(module: nn.Module, n_iters: int = 1):
+        """Wrap every nn.Linear in the given module subtree with torch's spectral_norm.
+
+        Spectral normalization (Miyato et al., 2018) divides each weight matrix W by its
+        largest singular value sigma_max(W) using power iteration, so the resulting
+        forward map W' = W / sigma_max has spectral norm exactly 1. Combined with
+        1-Lipschitz activations (ReLU, Mish, Identity), this gives a globally 1-Lipschitz
+        network -> ||J_res||_2 <= 1 everywhere -> forward Jacobian (I + J*dt) is
+        well-conditioned for any reasonable dt.
+
+        We use torch.nn.utils.parametrizations.spectral_norm (the modern API; the older
+        torch.nn.utils.spectral_norm has known issues with state_dict loading).
+        """
+        from torch.nn.utils.parametrizations import spectral_norm
+        # Walk the module tree and replace each Linear's weight with a spectrally
+        # normalized version. We must do this with a name+parent reference so the
+        # parametrization is registered on the actual child module.
+        for name, child in list(module.named_modules()):
+            if isinstance(child, nn.Linear):
+                # spectral_norm in-place wraps `child.weight` parametrization
+                spectral_norm(child, name="weight", n_power_iterations=n_iters)
+        log.info(f"Applied spectral_norm to all nn.Linear in {type(module).__name__} "
+                 f"(n_power_iterations={n_iters})")
 
     def _report_params(self):
         n_base = sum(p.numel() for p in self.v_base.parameters()) / 1e6

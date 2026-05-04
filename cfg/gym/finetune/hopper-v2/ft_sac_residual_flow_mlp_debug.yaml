@@ -144,3 +144,5 @@ model:
   zero_init_residual: true
   use_hutchinson: true               # DEBUG: Hutchinson trace estimator instead of slogdet
   hutchinson_n_samples: 1
+  use_spectral_norm: true            # DEBUG: hard 1-Lipschitz cap on v_res via spectral_norm
+  spectral_norm_n_iters: 1
