@@ -103,6 +103,7 @@ class TrainSACResidualFlowAgent(TrainAgent):
         loss_critic_val = 0.0
         loss_actor_val = 0.0
         last_actor_info = {}
+        last_critic_info = {}
 
         while self.itr < self.n_train_itr:
             if self.itr % 1000 == 0:
@@ -147,6 +148,8 @@ class TrainSACResidualFlowAgent(TrainAgent):
                         }
                         a = self.model.sample_action(cond, deterministic=eval_mode)
                         action_venv = a.cpu().numpy()[:, : self.act_steps]
+                action_venv = np.nan_to_num(action_venv, nan=0.0)
+                action_venv = np.clip(action_venv, -1.0, 1.0)
 
                 obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = (
                     self.venv.step(action_venv)
@@ -157,14 +160,18 @@ class TrainSACResidualFlowAgent(TrainAgent):
 
                 if not eval_mode:
                     for i in range(self.n_envs):
-                        obs_buffer.append(prev_obs_venv["state"][i])
+                        s_prev = prev_obs_venv["state"][i]
                         if "final_obs" in info_venv[i]:
-                            next_obs_buffer.append(info_venv[i]["final_obs"]["state"])
+                            s_next = info_venv[i]["final_obs"]["state"]
                         else:
-                            next_obs_buffer.append(obs_venv["state"][i])
+                            s_next = obs_venv["state"][i]
+                        if np.any(np.isnan(s_prev)) or np.any(np.isnan(s_next)):
+                            continue
+                        obs_buffer.append(s_prev)
+                        next_obs_buffer.append(s_next)
                         action_buffer.append(action_venv[i])
-                    reward_buffer.extend((reward_venv * self.scale_reward_factor).tolist())
-                    terminated_buffer.extend(terminated_venv.tolist())
+                        reward_buffer.append(float(reward_venv[i] * self.scale_reward_factor))
+                        terminated_buffer.append(float(terminated_venv[i]))
 
                     # Running episode reward / length, accumulated across iters.
                     # Flush to completed_* deques whenever an env terminates or truncates.
@@ -253,16 +260,16 @@ class TrainSACResidualFlowAgent(TrainAgent):
                 next_obs_dict = {"state": next_obs_b}
 
                 # ---- critic step
-                loss_critic = self.model.loss_critic(
+                loss_critic, last_critic_info = self.model.loss_critic(
                     obs_dict, next_obs_dict, actions_b, rewards_b, terminated_b, self.gamma
                 )
                 self.critic_optimizer.zero_grad()
                 loss_critic.backward()
-                # Clip critic gradients (defense against early-training Q-target divergence)
-                torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), max_norm=10.0)
+                critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), max_norm=10.0)
                 self.critic_optimizer.step()
                 self.model.update_target_critic(self.target_ema_rate)
                 loss_critic_val = loss_critic.item()
+                last_critic_info["grad_norm"] = critic_grad_norm.item()
 
                 # ---- actor step (delayed; skipped during critic warmup)
                 past_warmup = self.itr >= self.n_explore_steps + self.critic_warmup_iters
@@ -270,14 +277,16 @@ class TrainSACResidualFlowAgent(TrainAgent):
                     loss_actor, last_actor_info = self.model.loss_actor(obs_dict)
                     self.actor_optimizer.zero_grad()
                     loss_actor.backward()
-                    # Clip actor gradients (the gradient chains through K-1 ODE Jacobians;
-                    # without this, occasional bad samples can produce huge updates)
-                    torch.nn.utils.clip_grad_norm_(
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                         list(self.model.v_res.parameters()) + list(self.model.sigma_head.parameters()),
                         max_norm=1.0,
                     )
                     self.actor_optimizer.step()
                     loss_actor_val = loss_actor.item()
+                    last_actor_info["grad_norm"] = actor_grad_norm.item()
+                    with torch.no_grad():
+                        vres_norm = sum(p.norm().item()**2 for p in self.model.v_res.parameters())**0.5
+                    last_actor_info["v_res_param_norm"] = vres_norm
 
             # save model
             if self.itr % self.save_model_freq == 0 or self.itr == self.n_train_itr - 1:
@@ -318,8 +327,16 @@ class TrainSACResidualFlowAgent(TrainAgent):
                             "loss - actor": loss_actor_val,
                             "avg episode reward - train": avg_episode_reward,
                             "num episode - train": num_episode_finished,
+                            "buffer_size": len(obs_buffer),
                             **{f"actor/{k}": v for k, v in last_actor_info.items()},
+                            **{f"critic/{k}": v for k, v in last_critic_info.items()},
                         }
+                        if len(completed_ep_rewards) > 0:
+                            wandb_log_dict["episode/reward_mean"] = float(np.mean(completed_ep_rewards))
+                            wandb_log_dict["episode/reward_std"] = float(np.std(completed_ep_rewards))
+                            wandb_log_dict["episode/reward_max"] = float(np.max(completed_ep_rewards))
+                            wandb_log_dict["episode/reward_min"] = float(np.min(completed_ep_rewards))
+                            wandb_log_dict["episode/length_mean"] = float(np.mean(completed_ep_lens))
                         wandb.log(wandb_log_dict, step=self.itr, commit=True)
                     run_results[-1]["train_episode_reward"] = avg_episode_reward
                 with open(self.result_path, "wb") as f:

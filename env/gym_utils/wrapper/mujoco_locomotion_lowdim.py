@@ -86,9 +86,17 @@ class MujocoLocomotionLowdimWrapper(gym.Env):
 
     def step(self, action):
         raw_action = self.unnormalize_action(action)
-        raw_obs, reward, done, info = self.env.step(raw_action)
-
-        # normalize
+        raw_action = np.nan_to_num(raw_action, nan=0.0, posinf=0.0, neginf=0.0)
+        try:
+            raw_obs, reward, done, info = self.env.step(raw_action)
+        except Exception:
+            raw_obs = self.env.reset()
+            reward, done = 0.0, True
+            info = {}
+        if np.any(np.isnan(raw_obs)):
+            raw_obs = self.env.reset()
+            reward, done = 0.0, True
+            info = {}
         obs = self.normalize_obs(raw_obs)
         return {"state": obs}, reward, done, info
 

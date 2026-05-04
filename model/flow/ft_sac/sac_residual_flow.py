@@ -400,6 +400,8 @@ class SACResidualFlow(nn.Module):
             a_K        : (B, Ta, Da), reparameterized through ODE + final Gaussian
             kl         : (B,)        clamped to a sane range to defend against FP non-convergence
             jac_reg    : scalar
+            log_p_theta: (B,)        forward log-prob under combined policy
+            log_p_base : (B,)        backward log-prob under base policy
         """
         B = cond["state"].shape[0]
         device = self.device
@@ -440,7 +442,7 @@ class SACResidualFlow(nn.Module):
         eps = torch.randn_like(a_Km1).clamp(-self.randn_clip_value, self.randn_clip_value)
         a_K = (a_Km1 + v_last * dt + sigma * eps).clamp(self.act_min, self.act_max)
 
-        return a_K, kl, jac_reg
+        return a_K, kl, jac_reg, log_p_theta, log_p_base
 
     # ----------------------------------------------------------------- losses
     def loss_critic(self, obs, next_obs, actions, rewards, terminated, gamma):
@@ -450,14 +452,25 @@ class SACResidualFlow(nn.Module):
             q_t = torch.min(q1_t, q2_t)
             target = rewards + gamma * q_t * (1.0 - terminated)
         q1, q2 = self.critic(obs, actions)
-        return F.mse_loss(q1, target) + F.mse_loss(q2, target)
+        loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+        info = {
+            "q1_mean": q1.mean().item(),
+            "q2_mean": q2.mean().item(),
+            "q_target_mean": target.mean().item(),
+            "q_target_std": target.std().item(),
+            "q_target_max": target.max().item(),
+            "q_target_min": target.min().item(),
+            "reward_batch_mean": rewards.mean().item(),
+            "reward_batch_std": rewards.std().item(),
+        }
+        return loss, info
 
     def loss_actor(self, obs):
         """SAC actor loss with exact KL regularizer and sigma entropy bonus.
 
         L = -min(Q1,Q2)(s,a^K) + kl_w*KL + jac_w*||J_res||^2 - sigma_ent_w*log(sigma)
         """
-        a_K, kl, jac_reg = self.compute_kl_and_action(obs)
+        a_K, kl, jac_reg, log_p_theta, log_p_base = self.compute_kl_and_action(obs)
 
         q1, q2 = self.critic(obs, a_K)
         q_min = torch.min(q1, q2)
@@ -480,9 +493,16 @@ class SACResidualFlow(nn.Module):
             "kl_mean": kl.mean().item(),
             "kl_std": kl.std().item(),
             "kl_max": kl.max().item(),
+            "log_p_theta_mean": log_p_theta.mean().item(),
+            "log_p_theta_std": log_p_theta.std().item(),
+            "log_p_base_mean": log_p_base.mean().item(),
+            "log_p_base_std": log_p_base.std().item(),
             "q_mean": q_min.mean().item(),
             "sigma_mean": sigma.mean().item(),
             "sigma_min": sigma.min().item(),
             "sigma_max": sigma.max().item(),
+            "action_mean": a_K.mean().item(),
+            "action_std": a_K.std().item(),
+            "action_abs_max": a_K.abs().max().item(),
         }
         return total, info

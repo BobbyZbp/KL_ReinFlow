@@ -205,6 +205,23 @@ class SyncVectorEnv(VectorEnv):
         for env, value in zip(self.envs, values):
             setattr(env, name, value)
 
+    def reset_arg(self, options_list, **kwargs):
+        obs = []
+        for env, options in zip(self.envs, options_list):
+            observation = env.reset(options=options)
+            obs.append(observation)
+        if isinstance(obs[0], np.ndarray):
+            return np.stack(obs)
+        else:
+            assert isinstance(obs[0], dict)
+            return obs
+
+    def reset_one_arg(self, env_ind, options=None):
+        if options is None:
+            options = {}
+        obs = self.envs[env_ind].reset(options=options)
+        return obs
+
     def close_extras(self, **kwargs):
         """Close the environments."""
         [env.close() for env in self.envs]
