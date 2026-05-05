@@ -120,7 +120,18 @@ class TrainSACResidualFlowAgent(TrainAgent):
     def load_checkpoint(self, path):
         log.info(f"Resuming from {path}")
         data = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(data["model"])
+        missing, unexpected = self.model.load_state_dict(data["model"], strict=False)
+        if missing:
+            log.warning(f"Missing keys in checkpoint (new params): {missing}")
+        if unexpected:
+            log.warning(f"Unexpected keys in checkpoint: {unexpected}")
+        if any(k.startswith("ref_v_res.") for k in missing):
+            import copy
+            self.model.ref_v_res = copy.deepcopy(self.model.v_res).to(self.device)
+            for p in self.model.ref_v_res.parameters():
+                p.requires_grad = False
+            self.model.ref_v_res.eval()
+            log.info("Initialized ref_v_res from current v_res (not in checkpoint)")
         if "actor_optimizer" in data:
             self.actor_optimizer.load_state_dict(data["actor_optimizer"])
         if "critic_optimizer" in data:
@@ -168,6 +179,7 @@ class TrainSACResidualFlowAgent(TrainAgent):
         timer = Timer()
         run_results = []
         cnt_train_step = 0
+        prev_obs_venv = None
         done_venv = np.zeros((1, self.n_envs))
         loss_critic_val = 0.0
         loss_actor_val = 0.0
@@ -193,12 +205,13 @@ class TrainSACResidualFlowAgent(TrainAgent):
             )
             n_steps = self.n_steps if not eval_mode else int(1e5)
             self.model.eval() if eval_mode else self.model.train()
-            # always keep base policy in eval (frozen)
+            # always keep frozen submodules in eval
             self.model.v_base.eval()
+            self.model.ref_v_res.eval()
 
             # reset env at iteration start (eval, requested, or first iter)
             firsts_trajs = np.zeros((n_steps + 1, self.n_envs))
-            if self.reset_at_iteration or eval_mode or self.itr == 0:
+            if self.reset_at_iteration or eval_mode or prev_obs_venv is None:
                 prev_obs_venv = self.reset_env_all(options_venv=options_venv)
                 firsts_trajs[0] = 1
             else:
@@ -389,13 +402,17 @@ class TrainSACResidualFlowAgent(TrainAgent):
 
                         self.actor_update_count += 1
                         if self.ema_absorb_freq > 0 and self.actor_update_count % self.ema_absorb_freq == 0:
-                            try:
-                                self.model.absorb_residual_into_base(self.ema_absorb_tau)
-                                last_actor_info["ema_absorbed"] = 1.0
-                            except RuntimeError as e:
-                                if self.actor_update_count == self.ema_absorb_freq:
-                                    log.error(f"EMA absorption failed (disabling): {e}")
-                                    self.ema_absorb_freq = 0
+                            if self.kl_mode.endswith("_ref"):
+                                self.model.update_reference_policy(self.ema_absorb_tau)
+                                last_actor_info["ref_ema_updated"] = 1.0
+                            else:
+                                try:
+                                    self.model.absorb_residual_into_base(self.ema_absorb_tau)
+                                    last_actor_info["ema_absorbed"] = 1.0
+                                except RuntimeError as e:
+                                    if self.actor_update_count == self.ema_absorb_freq:
+                                        log.error(f"EMA absorption failed (disabling): {e}")
+                                        self.ema_absorb_freq = 0
 
                     loss_actor_val = loss_actor.item()
                     with torch.no_grad():

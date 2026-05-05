@@ -218,6 +218,54 @@ Parameter-space interpolation. Not exact for nonlinear MLPs (`v_base(x; theta_b 
 
 **Loses:** fixed reference. KL is measured against a moving target.
 
+**Limitation:** requires `v_base` and `v_res` to have identical architectures (same param shapes). In our setup, `v_base` is [512,512,512] (553K params) and `v_res` is [128,128] (24K params) — absorption is impossible.
+
+### LoRA-like reference policy (EMA of v_res)
+
+When `v_base` and `v_res` have different architectures, we cannot absorb `v_res` into `v_base`. Instead, we maintain a **reference residual** `ref_v_res` with the same architecture as `v_res`:
+
+```
+reference policy:  v_ref(a, t, s) = v_base(a, t, s) + ref_v_res(a, t, s)
+combined policy:   v_theta(a, t, s) = v_base(a, t, s) + v_res(a, t, s)
+```
+
+`ref_v_res` is initialized as a copy of `v_res` (zero-init at start), kept frozen (`requires_grad=False`, eval mode), and periodically updated via EMA:
+
+```python
+# every N actor updates:
+with torch.no_grad():
+    for p_ref, p_res in zip(ref_v_res.parameters(), v_res.parameters()):
+        p_ref.data.mul_(1 - tau).add_(p_res.data, alpha=tau)
+```
+
+The KL is then computed as `KL(p_theta || p_ref)` instead of `KL(p_theta || p_base)`. At each per-step KL computation, FP inversion uses `v_ref` instead of `v_base`:
+
+```
+a^k_inv + v_ref(a^k_inv, t_k) * dt = a^{k+1}_theta
+KL_k = logdet(I + J_ref(a^k_inv) * dt) - logdet(I + J_theta(a^k) * dt)
+```
+
+**Key properties:**
+- Same architecture for `ref_v_res` and `v_res` — EMA is exact (same param shapes).
+- At init, `ref_v_res = v_res = 0`, so `v_ref = v_base` and `KL = 0` (correct).
+- As training progresses, `ref_v_res` tracks `v_res` with a lag, so `v_ref ≈ v_theta` and KL stays small — the trust region moves with the policy.
+- FP inversion uses `v_ref` (which includes `v_base`), so it remains well-conditioned as long as `ref_v_res - v_res` is small.
+- `v_base` stays frozen and untouched — no architecture mismatch issues.
+
+**Analogy to LoRA:** in LoRA fine-tuning, the base model is frozen and a low-rank residual is trained. The reference for KL in RLHF is the LoRA model at init (or an EMA). Here, `v_base` is the frozen base, `v_res` is the "LoRA adapter," and `ref_v_res` is the reference adapter.
+
+**kl_mode values:**
+- `perstep_exact_ref` — per-step KL vs reference policy, exact slogdet
+- `perstep_hutchinson_ref` — per-step KL vs reference policy, Hutchinson trace
+
+**Config:**
+```yaml
+train:
+  kl_mode: perstep_exact_ref
+  ema_absorb_freq: 100    # update ref_v_res every 100 actor updates
+  ema_absorb_tau: 0.01    # EMA rate
+```
+
 ---
 
 ## The 8 combinations
@@ -230,8 +278,8 @@ Parameter-space interpolation. Not exact for nonlinear MLPs (`v_base(x; theta_b 
 | 4 | endpoint | Hutchinson | EMA | True KL (approx logdet). Safest endpoint variant: no slogdet NaN, EMA stabilizes inversion. |
 | 5 | per-step | exact | fixed | Per-step KL with one-step FP inversion. slogdet backward possible but well-conditioned (single step). Cross-entropy signal retained via a^k_inv. |
 | 6 | per-step | Hutchinson | fixed | Per-step KL with one-step FP inversion + Hutchinson. No slogdet backward. Cross-entropy signal retained (a^k_inv ≠ a^k prevents cancellation). Fully NaN-safe. |
-| 7 | per-step | exact | EMA | Like run 5 + EMA. Even better conditioned: EMA keeps v_res small → a^k_inv ≈ a^k, FP converges faster. |
-| 8 | per-step | Hutchinson | EMA | Like run 6 + EMA. Fully NaN-safe + EMA drift control. Most conservative. |
+| 7 | per-step | exact | EMA ref | Like run 5 + EMA reference policy (LoRA-style). KL vs `v_base + ref_v_res` with EMA-updated `ref_v_res`. Trust region moves with policy. `kl_mode=perstep_exact_ref`. |
+| 8 | per-step | Hutchinson | EMA ref | Like run 6 + EMA reference policy. Fully NaN-safe + drift control. Most conservative. `kl_mode=perstep_hutchinson_ref`. |
 
 ### Safety classification
 
@@ -242,6 +290,26 @@ Parameter-space interpolation. Not exact for nonlinear MLPs (`v_base(x; theta_b 
 **Partially safe:** 2, 4 (endpoint + Hutchinson). No slogdet NaN, but K-1 sequential FP inversions can diverge (error accumulates). EMA (run 4) mitigates.
 
 **Dangerous:** 1, 3 (endpoint + exact). Full NaN exposure from slogdet backward + K-1 inversions. EMA (run 3) helps but doesn't eliminate.
+
+### Experimental results (2026-05-04)
+
+**Endpoint exact slogdet is fatal.** Both exact-slogdet endpoint runs NaN'd early:
+
+| Run | Combo | NaN at iter | Reward at death | Cause |
+|-----|-------|-------------|-----------------|-------|
+| 11 | endpoint + exact + fixed | ~6,700 | 148 | slogdet backward → Q target NaN |
+| 13 | endpoint + exact + EMA ref | ~8,900 | 148 | same; EMA bought ~2k more iters |
+
+**Endpoint Hutchinson is stable.** Both Hutchinson endpoint runs survived:
+
+| Run | Combo | Status at iter 9k | Reward |
+|-----|-------|--------------------|--------|
+| 12 | endpoint + Hutchinson + fixed | healthy | 891 |
+| 14 | endpoint + Hutchinson + EMA ref | healthy | 873 |
+
+**Per-step exact slogdet is stable.** Runs 5, 5b, 7, 8 (per-step + exact + fixed, various kl_weights) all ran to 30-45k+ iterations without NaN. The single-step `logdet(I + J*dt)` is far better conditioned than the accumulated endpoint version.
+
+**Key finding:** the NaN killer is `slogdet` backward (requiring `M^{-1}` where `M = I + J*dt`), NOT the FP inversion or the endpoint formulation itself. Hutchinson eliminates slogdet backward entirely. Per-step exact also avoids it because single-step `I + J*dt` stays well-conditioned (eigenvalues bounded away from 0 for small `||J*dt||`), while endpoint accumulates K-1 steps of Jacobian products that can become near-singular.
 
 ### Which to prioritize
 

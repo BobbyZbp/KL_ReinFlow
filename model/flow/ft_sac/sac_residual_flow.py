@@ -133,6 +133,12 @@ class SACResidualFlow(nn.Module):
         if zero_init_residual:
             self._zero_init_velocity_head(self.v_res)
 
+        # reference residual for KL (same arch as v_res, zero-init, frozen)
+        self.ref_v_res: FlowMLP = copy.deepcopy(self.v_res).to(device)
+        for p in self.ref_v_res.parameters():
+            p.requires_grad = False
+        self.ref_v_res.eval()
+
         # twin critic + targets
         self.critic = critic.to(device)
         self.target_critic = copy.deepcopy(self.critic).to(device)
@@ -177,6 +183,9 @@ class SACResidualFlow(nn.Module):
     def _combined_velocity(self, a: Tensor, t: Tensor, cond: Dict[str, Tensor]) -> Tensor:
         return self.v_base(a, t, cond) + self.v_res(a, t, cond)
 
+    def _reference_velocity(self, a: Tensor, t: Tensor, cond: Dict[str, Tensor]) -> Tensor:
+        return self.v_base(a, t, cond) + self.ref_v_res(a, t, cond)
+
     def update_target_critic(self, tau=None):
         tau = self.target_ema_rate if tau is None else tau
         with torch.no_grad():
@@ -203,6 +212,12 @@ class SACResidualFlow(nn.Module):
                         f"Architectures must match.")
                 p_base.data.add_(p_res.data, alpha=tau)
                 p_res.data.mul_(1.0 - tau)
+
+    def update_reference_policy(self, tau: float):
+        """EMA update: ref_v_res ← (1-tau)*ref_v_res + tau*v_res."""
+        with torch.no_grad():
+            for p_ref, p_res in zip(self.ref_v_res.parameters(), self.v_res.parameters()):
+                p_ref.data.mul_(1.0 - tau).add_(p_res.data, alpha=tau)
 
     # --------------------------------------------------------------- sampling
     def sample_action(
@@ -284,6 +299,13 @@ class SACResidualFlow(nn.Module):
         t = t_scalar.unsqueeze(0)
         cond = {"state": cond_state.unsqueeze(0)}
         v = self.v_res(a, t, cond).squeeze(0).flatten()
+        return v
+
+    def _per_sample_reference_velocity_flat(self, a_flat, t_scalar, cond_state):
+        a = a_flat.view(self.horizon_steps, self.action_dim).unsqueeze(0)
+        t = t_scalar.unsqueeze(0)
+        cond = {"state": cond_state.unsqueeze(0)}
+        v = self._reference_velocity(a, t, cond).squeeze(0).flatten()
         return v
 
     def forward_with_logdet(self, cond: Dict[str, Tensor]):
@@ -464,6 +486,16 @@ class SACResidualFlow(nn.Module):
             a_inv = a_next - self.v_base(a_inv, t_k, cond) * dt
         return a_inv
 
+    @torch.no_grad()
+    def _one_step_fp_inversion_ref(self, a_next: Tensor, t_k: Tensor,
+                                   cond: Dict[str, Tensor]) -> Tensor:
+        """Find a_inv such that a_inv + v_ref(a_inv, t_k)*dt = a_next via FP iteration."""
+        dt = 1.0 / self.inference_steps
+        a_inv = a_next - self._reference_velocity(a_next, t_k, cond) * dt
+        for _ in range(self.perstep_fp_iters):
+            a_inv = a_next - self._reference_velocity(a_inv, t_k, cond) * dt
+        return a_inv
+
     def backward_base_logprob(self, a_Km1: Tensor, cond: Dict[str, Tensor]) -> Tensor:
         """Compute log p_base^det(a^{K-1}) where a^{K-1} = a_Km1.
 
@@ -518,13 +550,84 @@ class SACResidualFlow(nn.Module):
 
         return log_p0 - sum_logdet
 
+    # -------------------- backward ref ODE with fixed-point iteration --------
+    @torch.no_grad()
+    def _backward_ref_recover_trajectory(self, a_Km1: Tensor, cond: Dict[str, Tensor]):
+        """Like _backward_base_recover_trajectory but inverts the reference ODE (v_base + ref_v_res)."""
+        B = a_Km1.shape[0]
+        device = self.device
+        K = self.inference_steps
+        dt = 1.0 / K
+
+        a_curr = a_Km1
+        rev_traj_a = []
+        rev_traj_t = []
+
+        for k in range(K - 2, -1, -1):
+            t_k = torch.full((B,), k * dt, device=device)
+            v_explicit = self._reference_velocity(a_curr, t_k, cond)
+            a_prev = a_curr - dt * v_explicit
+            for _ in range(self.backward_fp_iters):
+                v_fp = self._reference_velocity(a_prev, t_k, cond)
+                a_prev = a_curr - dt * v_fp
+            rev_traj_a.append(a_prev)
+            rev_traj_t.append(t_k)
+            a_curr = a_prev
+
+        traj_a = list(reversed(rev_traj_a))
+        traj_t = list(reversed(rev_traj_t))
+        return traj_a, traj_t
+
+    def backward_ref_logprob(self, a_Km1: Tensor, cond: Dict[str, Tensor]) -> Tensor:
+        """Compute log p_ref^det(a^{K-1}) using the reference policy (v_base + ref_v_res)."""
+        B = a_Km1.shape[0]
+        device = self.device
+        K = self.inference_steps
+        dt = 1.0 / K
+        D = self.act_dim_total
+        I_D = torch.eye(D, device=device).unsqueeze(0)
+
+        traj_a_nograd, traj_t = self._backward_ref_recover_trajectory(a_Km1, cond)
+
+        traj_a = []
+        a_next = a_Km1
+        for k in range(K - 2, -1, -1):
+            a_neigh = traj_a_nograd[k]
+            t_k = torch.full((B,), k * dt, device=device)
+            v_at_neigh = self._reference_velocity(a_neigh, t_k, cond)
+            a_prev = a_next - dt * v_at_neigh
+            traj_a.insert(0, a_prev)
+            a_next = a_prev
+
+        a0 = traj_a[0]
+        log_p0_elementwise = -0.5 * (a0 ** 2 + 1.8378770664093453)
+        log_p0 = torch.nan_to_num(log_p0_elementwise, nan=0.0, posinf=0.0, neginf=-1e4).sum(dim=(-2, -1))
+
+        sum_logdet = torch.zeros(B, device=device)
+        for k in range(K - 1):
+            a_k = traj_a[k]
+            t_k = traj_t[k]
+            J = vmap(jacrev(self._per_sample_reference_velocity_flat, argnums=0))(
+                a_k.view(B, D), t_k, cond["state"]
+            )
+            M = I_D + J * dt
+            _, logabsdet = torch.linalg.slogdet(M)
+            sum_logdet = sum_logdet + logabsdet
+
+        return log_p0 - sum_logdet
+
     # ------------------------------------------------------------- per-step KL
     def compute_perstep_kl_and_action(self, cond: Dict[str, Tensor]):
         """Per-step KL with one-step FP inversion at each ODE step.
 
-        At each step k, finds a^k_inv via FP inversion of the base map, then
-        KL_k = logdet(I + J_base(a^k_inv)*dt) - logdet(I + J_combined(a^k)*dt).
-        Uses exact slogdet (perstep_exact) or Hutchinson trace (perstep_hutchinson).
+        At each step k, finds a^k_inv via FP inversion of the reference map, then
+        KL_k = logdet(I + J_ref(a^k_inv)*dt) - logdet(I + J_combined(a^k)*dt).
+
+        kl_mode determines the reference and estimator:
+          perstep_exact       — v_base reference, exact slogdet
+          perstep_hutchinson  — v_base reference, Hutchinson trace
+          perstep_exact_ref   — v_base+ref_v_res reference, exact slogdet
+          perstep_hutchinson_ref — v_base+ref_v_res reference, Hutchinson trace
 
         Returns same signature as compute_kl_and_action.
         """
@@ -533,7 +636,17 @@ class SACResidualFlow(nn.Module):
         K = self.inference_steps
         dt = 1.0 / K
         D = self.act_dim_total
-        use_hutchinson = self.kl_mode == "perstep_hutchinson"
+        use_hutchinson = self.kl_mode in ("perstep_hutchinson", "perstep_hutchinson_ref")
+        use_ref = self.kl_mode in ("perstep_exact_ref", "perstep_hutchinson_ref")
+
+        if use_ref:
+            fp_invert = self._one_step_fp_inversion_ref
+            ref_vel_fn = self._reference_velocity
+            ref_jac_fn = self._per_sample_reference_velocity_flat
+        else:
+            fp_invert = self._one_step_fp_inversion
+            ref_vel_fn = self.v_base
+            ref_jac_fn = self._per_sample_base_velocity_flat
 
         a = torch.randn(B, self.horizon_steps, self.action_dim, device=device)
         log_p0 = Normal(torch.zeros_like(a), 1.0).log_prob(a).sum(dim=(-2, -1))
@@ -554,16 +667,15 @@ class SACResidualFlow(nn.Module):
             v = self._combined_velocity(a, t, cond)
             a_next = a + v * dt
 
-            # One-step FP inversion (no_grad) + differentiable refinement
-            a_inv_ng = self._one_step_fp_inversion(a_next, t, cond)
-            v_at_inv = self.v_base(a_inv_ng, t, cond)
+            a_inv_ng = fp_invert(a_next, t, cond)
+            v_at_inv = ref_vel_fn(a_inv_ng, t, cond)
             a_inv = a_next - v_at_inv * dt
 
             if use_hutchinson:
                 a_flat = a.view(B, D)
                 a_inv_flat = a_inv.view(B, D)
                 tr_combined = torch.zeros(B, device=device)
-                tr_base = torch.zeros(B, device=device)
+                tr_ref = torch.zeros(B, device=device)
 
                 for _ in range(self.hutchinson_samples):
                     v_probe = torch.randint(0, 2, (B, D), device=device).float() * 2 - 1
@@ -572,19 +684,24 @@ class SACResidualFlow(nn.Module):
                         aa = af.view(B, self.horizon_steps, self.action_dim)
                         return self._combined_velocity(aa, _t, _c).view(B, D)
 
-                    def vel_base(af, _t=t, _c=cond):
-                        aa = af.view(B, self.horizon_steps, self.action_dim)
-                        return self.v_base(aa, _t, _c).view(B, D)
+                    if use_ref:
+                        def vel_ref(af, _t=t, _c=cond):
+                            aa = af.view(B, self.horizon_steps, self.action_dim)
+                            return self._reference_velocity(aa, _t, _c).view(B, D)
+                    else:
+                        def vel_ref(af, _t=t, _c=cond):
+                            aa = af.view(B, self.horizon_steps, self.action_dim)
+                            return self.v_base(aa, _t, _c).view(B, D)
 
                     _, Jv_c = torch.func.jvp(vel_comb, (a_flat,), (v_probe,))
-                    _, Jv_b = torch.func.jvp(vel_base, (a_inv_flat,), (v_probe,))
+                    _, Jv_r = torch.func.jvp(vel_ref, (a_inv_flat,), (v_probe,))
                     tr_combined = tr_combined + (v_probe * Jv_c).sum(dim=-1)
-                    tr_base = tr_base + (v_probe * Jv_b).sum(dim=-1)
+                    tr_ref = tr_ref + (v_probe * Jv_r).sum(dim=-1)
 
                 tr_combined = tr_combined / self.hutchinson_samples
-                tr_base = tr_base / self.hutchinson_samples
+                tr_ref = tr_ref / self.hutchinson_samples
                 logdet_combined_k = tr_combined * dt
-                logdet_base_k = tr_base * dt
+                logdet_ref_k = tr_ref * dt
             else:
                 cond_state = cond["state"]
                 J_comb = vmap(jacrev(self._per_sample_combined_velocity_flat, argnums=0))(
@@ -593,14 +710,14 @@ class SACResidualFlow(nn.Module):
                 M_c = I_D + J_comb * dt
                 _, logdet_combined_k = torch.linalg.slogdet(M_c)
 
-                J_base = vmap(jacrev(self._per_sample_base_velocity_flat, argnums=0))(
+                J_ref = vmap(jacrev(ref_jac_fn, argnums=0))(
                     a_inv.view(B, D), t, cond_state
                 )
-                M_b = I_D + J_base * dt
-                _, logdet_base_k = torch.linalg.slogdet(M_b)
+                M_r = I_D + J_ref * dt
+                _, logdet_ref_k = torch.linalg.slogdet(M_r)
 
             sum_logdet_combined = sum_logdet_combined + logdet_combined_k
-            sum_kl = sum_kl + (logdet_base_k - logdet_combined_k)
+            sum_kl = sum_kl + (logdet_ref_k - logdet_combined_k)
             a = a_next
 
         log_p_theta = log_p0 - sum_logdet_combined
@@ -635,8 +752,12 @@ class SACResidualFlow(nn.Module):
           "exact"               — endpoint: full Jacobian + slogdet (dangerous backward)
           "hutchinson"          — endpoint: Hutchinson trace (detached base)
           "detach_logdet"       — endpoint: exact logdet value, detached gradient
+          "exact_ref"           — endpoint: exact slogdet vs EMA reference policy
+          "hutchinson_ref"      — endpoint: Hutchinson trace vs EMA reference policy
           "perstep_exact"       — per-step KL with one-step FP inversion + exact slogdet
           "perstep_hutchinson"  — per-step KL with one-step FP inversion + Hutchinson trace
+          "perstep_exact_ref"       — per-step KL vs EMA ref policy + exact slogdet
+          "perstep_hutchinson_ref"  — per-step KL vs EMA ref policy + Hutchinson trace
 
         Returns:
             a_K        : (B, Ta, Da)
@@ -647,7 +768,8 @@ class SACResidualFlow(nn.Module):
             eps        : (B, Ta, Da)  noise sample at last step
             sigma      : (B, Ta, Da)  sigma_head output
         """
-        if self.kl_mode in ("perstep_exact", "perstep_hutchinson"):
+        if self.kl_mode in ("perstep_exact", "perstep_hutchinson",
+                             "perstep_exact_ref", "perstep_hutchinson_ref"):
             return self.compute_perstep_kl_and_action(cond)
 
         B = cond["state"].shape[0]
@@ -656,24 +778,23 @@ class SACResidualFlow(nn.Module):
         dt = 1.0 / K
         D = self.act_dim_total
 
-        if self.kl_mode == "hutchinson":
+        if self.kl_mode in ("hutchinson", "hutchinson_ref"):
             a_Km1, log_p_theta, traj_a, traj_t = self.forward_with_hutchinson_logdet(cond)
         elif self.kl_mode == "detach_logdet":
             a_Km1, log_p_theta, traj_a, traj_t = self.forward_with_detached_logdet(cond)
         else:
             a_Km1, log_p_theta, traj_a, traj_t = self.forward_with_logdet(cond)
 
-        # For hutchinson/detach_logdet: detach log_p_base to avoid Path 3b
-        # (slogdet backward in backward_base_logprob). KL gradient comes
-        # entirely from log_p_theta side. log_p_base is still computed for
-        # the KL value (monitoring) but contributes no gradient.
-        detach_base = self.kl_mode in ("hutchinson", "detach_logdet")
+        use_ref = self.kl_mode in ("exact_ref", "hutchinson_ref")
+        backward_fn = self.backward_ref_logprob if use_ref else self.backward_base_logprob
+
+        detach_base = self.kl_mode in ("hutchinson", "detach_logdet", "hutchinson_ref")
         if detach_base:
             with torch.no_grad():
-                log_p_base = self.backward_base_logprob(a_Km1, cond)
+                log_p_base = backward_fn(a_Km1, cond)
             log_p_base = log_p_base.detach()
         else:
-            log_p_base = self.backward_base_logprob(a_Km1, cond)
+            log_p_base = backward_fn(a_Km1, cond)
 
         kl_raw = log_p_theta - log_p_base
         kl = torch.nan_to_num(kl_raw, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -753,11 +874,15 @@ class SACResidualFlow(nn.Module):
         KL term depends on self.kl_mode:
           "none"           — no KL, just SAC + entropy (baseline)
           "reward_penalty" — KL handled in reward, not in actor loss
-          "exact"              — full Jacobian + slogdet (original, dangerous backward)
-          "hutchinson"         — trace estimator (clean backward)
-          "detach_logdet"      — exact value, detached gradient (weak KL signal)
-          "perstep_exact"      — per-step KL with one-step FP inversion + exact slogdet
-          "perstep_hutchinson" — per-step KL with one-step FP inversion + Hutchinson
+          "exact"              — endpoint: full Jacobian + slogdet (dangerous backward)
+          "hutchinson"         — endpoint: Hutchinson trace (clean backward)
+          "detach_logdet"      — endpoint: exact value, detached gradient
+          "exact_ref"          — endpoint: exact slogdet vs EMA reference policy
+          "hutchinson_ref"     — endpoint: Hutchinson vs EMA reference policy
+          "perstep_exact"      — per-step KL + exact slogdet
+          "perstep_hutchinson" — per-step KL + Hutchinson
+          "perstep_exact_ref"      — per-step KL vs EMA reference policy + exact slogdet
+          "perstep_hutchinson_ref" — per-step KL vs EMA reference policy + Hutchinson
           "vres_l2"            — ||v_res||^2 proxy (no Jacobians)
         """
         import math
