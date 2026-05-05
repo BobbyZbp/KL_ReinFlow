@@ -73,6 +73,12 @@ class TrainSACResidualFlowAgent(TrainAgent):
         self.model.vres_l2_weight = self.vres_l2_weight
         self.hutchinson_samples = cfg.train.get("hutchinson_samples", 1)
         self.model.hutchinson_samples = self.hutchinson_samples
+        self.perstep_fp_iters = cfg.train.get("perstep_fp_iters", 10)
+        self.model.perstep_fp_iters = self.perstep_fp_iters
+
+        self.ema_absorb_freq = cfg.train.get("ema_absorb_freq", 0)
+        self.ema_absorb_tau = cfg.train.get("ema_absorb_tau", 0.01)
+        self.actor_update_count = 0
 
         # n_steps per outer iteration is set by parent TrainAgent.__init__ from cfg.train.n_steps.
         # Default to 1 to mimic standard SAC if parent didn't set it.
@@ -88,7 +94,8 @@ class TrainSACResidualFlowAgent(TrainAgent):
             f"alpha={self.alpha} kl_w={self.kl_weight} jac_w={self.jac_weight} "
             f"sigma_ent_w={self.sigma_entropy_weight} critic_warmup={self.critic_warmup_iters} "
             f"kl_mode={self.kl_mode} kl_reward_w={self.kl_reward_weight} "
-            f"vres_l2_w={self.vres_l2_weight}"
+            f"vres_l2_w={self.vres_l2_weight} "
+            f"ema_freq={self.ema_absorb_freq} ema_tau={self.ema_absorb_tau}"
         )
 
     # ----------------------------------------------------------- checkpointing
@@ -98,6 +105,7 @@ class TrainSACResidualFlowAgent(TrainAgent):
             "model": self.model.state_dict(),
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
+            "actor_update_count": self.actor_update_count,
         }
         if replay_buffers is not None:
             data["replay"] = {
@@ -118,8 +126,10 @@ class TrainSACResidualFlowAgent(TrainAgent):
         if "critic_optimizer" in data:
             self.critic_optimizer.load_state_dict(data["critic_optimizer"])
         self.itr = data["itr"] + 1
+        self.actor_update_count = data.get("actor_update_count", 0)
         self._resumed_replay = data.get("replay", None)
-        log.info(f"Resumed at itr={self.itr} (replay={'yes' if self._resumed_replay else 'no'})")
+        log.info(f"Resumed at itr={self.itr} actor_updates={self.actor_update_count} "
+                 f"(replay={'yes' if self._resumed_replay else 'no'})")
 
     # ----------------------------------------------------------------- run
     def run(self):
@@ -151,6 +161,7 @@ class TrainSACResidualFlowAgent(TrainAgent):
         completed_ep_rewards = deque(maxlen=200)
         completed_ep_lens = deque(maxlen=200)
         recent_kl_penalties = deque(maxlen=200)
+        recent_kl_raw = deque(maxlen=200)
         recent_raw_rewards = deque(maxlen=200)
         recent_modified_rewards = deque(maxlen=200)
 
@@ -249,6 +260,7 @@ class TrainSACResidualFlowAgent(TrainAgent):
                         recent_raw_rewards.append(r_raw)
                         recent_modified_rewards.append(r_modified)
                         recent_kl_penalties.append(kl_pen)
+                        recent_kl_raw.append(float(kl_penalty_np[i]))
 
                     # Running episode reward / length, accumulated across iters.
                     # Flush to completed_* deques whenever an env terminates or truncates.
@@ -374,6 +386,17 @@ class TrainSACResidualFlowAgent(TrainAgent):
                         )
                         self.actor_optimizer.step()
                         last_actor_info["grad_norm"] = actor_grad_norm.item()
+
+                        self.actor_update_count += 1
+                        if self.ema_absorb_freq > 0 and self.actor_update_count % self.ema_absorb_freq == 0:
+                            try:
+                                self.model.absorb_residual_into_base(self.ema_absorb_tau)
+                                last_actor_info["ema_absorbed"] = 1.0
+                            except RuntimeError as e:
+                                if self.actor_update_count == self.ema_absorb_freq:
+                                    log.error(f"EMA absorption failed (disabling): {e}")
+                                    self.ema_absorb_freq = 0
+
                     loss_actor_val = loss_actor.item()
                     with torch.no_grad():
                         vres_norm = sum(p.norm().item()**2 for p in self.model.v_res.parameters())**0.5
@@ -438,6 +461,10 @@ class TrainSACResidualFlowAgent(TrainAgent):
                             wandb_log_dict["reward/raw_mean"] = float(np.mean(recent_raw_rewards))
                             wandb_log_dict["reward/modified_mean"] = float(np.mean(recent_modified_rewards))
                             wandb_log_dict["reward/kl_penalty_mean"] = float(np.mean(recent_kl_penalties))
+                        if len(recent_kl_raw) > 0:
+                            wandb_log_dict["reward/kl_raw_mean"] = float(np.mean(recent_kl_raw))
+                            wandb_log_dict["reward/kl_raw_max"] = float(np.max(recent_kl_raw))
+                            wandb_log_dict["reward/kl_raw_min"] = float(np.min(recent_kl_raw))
                         wandb.log(wandb_log_dict, step=self.itr, commit=True)
                     run_results[-1]["train_episode_reward"] = avg_episode_reward
                 with open(self.result_path, "wb") as f:

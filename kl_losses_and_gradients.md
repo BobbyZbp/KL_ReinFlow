@@ -247,32 +247,137 @@ The trajectory points `traj_a[k]` come from `sample_action(return_trajectory=Tru
 
 ---
 
+## Mathematical analysis: what does detaching log_p_base actually do?
+
+### Full KL gradient decomposition
+
+The KL divergence we want to minimize is:
+
+```
+KL(p_θ || p_base) = E_{x ~ p_θ}[log p_θ(x) - log p_base(x)]
+```
+
+We compute this via reparameterization: sample `z ~ N(0, I)`, run the deterministic ODE `x = T_θ(z)`:
+
+```
+KL = E_{z ~ N(0,I)} [log p_θ(T_θ(z)) − log p_base(T_θ(z))]
+```
+
+The gradient w.r.t. θ (v_res parameters):
+
+```
+∂KL/∂θ = E_z [∂/∂θ log p_θ(T_θ(z))]  −  E_z [∂/∂θ log p_base(T_θ(z))]
+              \________________________/       \_________________________/
+                      Term 1                            Term 2
+```
+
+**Term 1** — via change of variables, `log p_θ(T_θ(z)) = log p_0(z) − Σ_k log|det(I + J_k · dt)|`. Since `z` is sampled (independent of θ), `∂log p_0(z)/∂θ = 0`:
+
+```
+Term 1 = −∂/∂θ Σ_k log|det(I + J_{θ,k} · dt)|
+```
+
+This captures how the flow's volume change depends on θ. Minimizing Term 1 pushes the flow to be more volume-expanding → spreads out probability mass. Recalling that `E_{p_θ}[log p_θ] = −H(p_θ)`, minimizing Term 1 is **entropy maximization of p_θ**.
+
+**Term 2** — the base density evaluated at the theta-policy's sample:
+
+```
+Term 2 = ∇_x log p_base(x)|_{x=T_θ(z)} · ∂T_θ(z)/∂θ
+```
+
+This is the **score of the base policy** (direction of steepest density increase) dotted with how the sample point moves as θ changes. Minimizing KL means maximizing Term 2: **move samples toward regions where p_base is dense**. This is the mode-seeking / constraining term.
+
+The full KL decomposes as `KL = −H(p_θ) + H(p_θ, p_base)`:
+
+| Component | Term | Role |
+|-----------|------|------|
+| `−H(p_θ) = E_{p_θ}[log p_θ]` | Term 1 | Entropy of theta — minimizing pushes mass apart |
+| `H(p_θ, p_base) = E_{p_θ}[−log p_base]` | Term 2 | Cross-entropy — minimizing pulls mass toward base modes |
+
+**Both terms are needed for KL to constrain toward the base.** Term 1 alone just maximizes entropy. Term 2 alone just mode-seeks.
+
+### What detaching log_p_base does to each method
+
+When we set `log_p_base = log_p_base.detach()`, Term 2 vanishes:
+
+```
+∂L_detached/∂θ = kl_weight · E_z [−∂/∂θ Σ_k log|det(I + J_{θ,k} · dt)|]
+```
+
+This is **pure entropy maximization of p_θ's deterministic ODE flow**, with no constraint toward the base.
+
+**Method C (Hutchinson, detached base):**
+
+The gradient through `log_p_theta_hutch` is live (via JVP trace estimator):
+
+```
+∂L/∂θ = kl_weight · E_z [−∂/∂θ Σ_k tr(J_{combined,k}) · dt]
+```
+
+Since `tr(J_combined) = tr(J_base) + tr(J_res)` and v_base is frozen:
+
+```
+= −kl_weight · Σ_k [∂tr(J_base(a^k))/∂a^k · ∂a^k/∂θ + ∂tr(J_res(a^k; θ))/∂θ] · dt
+```
+
+This pushes v_res to increase the combined Jacobian's trace → more volume-expanding flow → higher entropy. **It is an ODE entropy bonus, not KL minimization.** It prevents the deterministic flow from collapsing to a delta function, but it does not attract the policy toward p_base's modes.
+
+**Method D (detach_logdet, detached base):**
+
+`log_p_theta = log_p_0(z) − sum_logdet.detach()`. Both components have zero gradient w.r.t. θ:
+- `log_p_0(z)`: z is sampled noise
+- `sum_logdet`: explicitly detached
+
+So `∂L/∂θ = 0`. The KL term is a constant in the loss — not even entropy maximization. Functionally identical to method A.
+
+**Method B (reward penalty) — the only true KL method:**
+
+B computes the full KL **value** (both terms) under `torch.no_grad()` and subtracts from the reward:
+
+```
+r_modified = r_env − λ · KL(p_θ || p_base)
+```
+
+The critic learns `Q(s, a) ≈ E[Σ (r_env − λ · KL)]`. When the actor maximizes Q:
+- High-KL actions → lower Q-values → actor avoids them
+- The full KL value shapes the Q-landscape, preserving both the entropy term and the cross-entropy term
+
+The mode-seeking behavior is intact: actions landing in low-base-density regions get penalized through the KL reward, which the critic propagates back to the actor. B doesn't differentiate through KL, so it avoids all dangerous gradient paths while still carrying the complete KL signal.
+
+### Conclusion
+
+**Detaching log_p_base eliminates the mode-constraining property of KL.** The cross-entropy term `H(p_θ, p_base) = E_{p_θ}[−log p_base]` — which is the entire reason to use KL regularization — requires differentiating through `backward_base_logprob`, including its slogdet. That is exactly the operation that causes NaN (Path 3b).
+
+This creates a fundamental tension:
+- **Safe gradient** (detached base) → no mode-seeking → not really KL
+- **Full KL gradient** (live base) → mode-seeking works → but NaN from slogdet backward
+
+Method B resolves this tension by removing KL from the gradient entirely and putting it in the reward. The critic acts as a "gradient laundry" — it converts the full KL value into a smooth Q-function gradient, avoiding the ill-conditioned matrix inverse altogether.
+
+A possible future direction: approximate `∇_x log p_base(x)` (the base score function) without slogdet — e.g., via a learned score network or denoising score matching — to recover Term 2 safely.
+
+---
+
 ## Summary table
 
-| Method | KL in actor loss? | KL gradient to v_res? | KL in reward? | Dangerous paths? | What actually regularizes v_res? |
-|--------|-------------------|----------------------|---------------|-----------------|--------------------------------|
-| A (none) | No | No | No | None | Only Q-values |
-| B (reward_penalty) | No | No (indirectly via Q) | Yes | None (no_grad) | Q-values trained on r - 0.05*KL |
-| C (hutchinson) | Yes | Yes (via JVP trace) | No | None (Path 3b fixed) | Q-values + direct KL gradient through Hutchinson trace |
-| D (detach_logdet) | Numerically yes, gradient no | No (zero gradient) | No | None (all detached) | Only Q-values (same as A) |
-| E (vres_l2) | No | No | No | None | Q-values + 0.01 * ||v_res||^2 penalty |
-
-### Which methods actually use KL for training?
-
-**Only B and C.**
-
-- **B** uses exact KL to modify the reward signal. The actor never differentiates through KL, but the critic learns that high-KL actions have lower value. The KL signal is real but lagged (replay buffer → critic → actor).
-
-- **C** uses approximate KL (Hutchinson trace) directly in the actor loss. The gradient `∂KL/∂θ` flows through the trace estimator's JVP, giving a direct (if noisy) signal to keep `log_p_theta` close to `log_p_base`. This is the only method where the actor's gradient explicitly contains a KL term.
-
-- **D** computes exact KL but contributes zero gradient. It's a monitoring tool, not a training signal.
-
-- **E** uses `||v_res||^2` as a proxy for KL, but this is not KL — it penalizes the magnitude of the residual uniformly regardless of direction.
+| Method | KL in actor loss? | Actual gradient effect | KL in reward? | Dangerous paths? | Mode-constraining? |
+|--------|-------------------|----------------------|---------------|-----------------|-------------------|
+| A (none) | No | — | No | None | No |
+| B (reward_penalty) | No | Indirect via Q-values | Yes (full KL value) | None (no_grad) | **Yes** (through critic) |
+| C (hutchinson) | Yes | ODE entropy maximization | No | None (Path 3b fixed) | No (lost with detach) |
+| D (detach_logdet) | Numerically yes | Zero gradient | No | None (all detached) | No |
+| E (vres_l2) | No | Magnitude penalty on v_res | No | None | No (crude proxy) |
 
 ### How we solved NaN
 
 1. **SAC entropy (`alpha=0.1`)** — the critical first fix. Without it, Q-value overestimation causes critic divergence regardless of KL mode.
 
-2. **Detaching `log_p_base`** — the key discovery. Both the theta-side (`slogdet` of combined Jacobian) and the base-side (`slogdet` of base Jacobian in `backward_base_logprob`) have the same failure mode: `slogdet` backward requires `M^{-1}`, which explodes when `M = I + J*dt` is near-singular. For Hutchinson and detach_logdet modes, we detach `log_p_base` entirely (`torch.no_grad()` around `backward_base_logprob`), eliminating Path 3b. The KL value is still correct for logging; only the gradient through the base density is dropped.
+2. **Detaching `log_p_base`** — eliminates Path 3b (slogdet backward in `backward_base_logprob`). Both the theta-side (`slogdet` of combined Jacobian, Path 2) and the base-side (`slogdet` of base Jacobian, Path 3b) share the same failure mode: `slogdet` backward requires `M^{-1}`, which explodes when near-singular. For Hutchinson and detach_logdet modes, we detach `log_p_base` entirely, eliminating Path 3b. The KL value is still correct for logging; only the gradient through the base density is dropped. **The cost: we lose the mode-constraining cross-entropy term.**
 
 After both fixes, all five methods survived 145k–180k iterations with zero NaN.
+
+### Which methods actually use KL for training?
+
+**Only B.** It is the only method where the full KL (entropy + cross-entropy) shapes the actor's behavior, carried through the critic's Q-values rather than through direct differentiation.
+
+C's "KL loss" with detached base is actually an ODE entropy bonus — useful for preventing flow collapse but not for constraining toward the base policy. D contributes zero gradient. E is a magnitude proxy unrelated to KL.

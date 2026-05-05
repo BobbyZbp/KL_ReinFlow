@@ -83,7 +83,10 @@ train:
   kl_mode: none                       # none | reward_penalty | hutchinson | detach_logdet | vres_l2 | exact
   kl_reward_weight: 0.0               # weight for KL reward penalty (kl_mode=reward_penalty)
   vres_l2_weight: 0.0                 # weight for ||v_res||^2 penalty (kl_mode=vres_l2)
-  hutchinson_samples: 1               # Hutchinson trace samples (kl_mode=hutchinson)
+  hutchinson_samples: 1               # Hutchinson trace samples (kl_mode=hutchinson or perstep_hutchinson)
+  perstep_fp_iters: 10               # FP iterations for per-step KL inversion (kl_mode=perstep_*)
+  ema_absorb_freq: 0                  # absorb v_res into v_base every N actor updates (0=disabled)
+  ema_absorb_tau: 0.01                # absorption rate: v_base += tau*v_res, v_res *= (1-tau)
   verbose: false
 
 model:
@@ -147,3 +150,4 @@ model:
   kl_mode: ${train.kl_mode}
   vres_l2_weight: ${train.vres_l2_weight}
   hutchinson_samples: ${train.hutchinson_samples}
+  perstep_fp_iters: ${train.perstep_fp_iters}

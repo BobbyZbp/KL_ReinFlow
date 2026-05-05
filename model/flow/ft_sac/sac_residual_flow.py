@@ -87,6 +87,7 @@ class SACResidualFlow(nn.Module):
         denoised_clip_value: float = 1.0,
         randn_clip_value: float = 3.0,
         backward_fp_iters: int = 10,
+        perstep_fp_iters: int = 10,
         alpha: float = 0.1,
         kl_weight: float = 0.05,
         jac_weight: float = 0.01,
@@ -110,6 +111,7 @@ class SACResidualFlow(nn.Module):
         self.denoised_clip_value = denoised_clip_value
         self.randn_clip_value = randn_clip_value
         self.backward_fp_iters = backward_fp_iters
+        self.perstep_fp_iters = perstep_fp_iters
         self.alpha = alpha
         self.kl_weight = kl_weight
         self.jac_weight = jac_weight
@@ -180,6 +182,27 @@ class SACResidualFlow(nn.Module):
         with torch.no_grad():
             for tp, p in zip(self.target_critic.parameters(), self.critic.parameters()):
                 tp.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
+
+    def absorb_residual_into_base(self, tau: float = 1.0):
+        """EMA-style absorption: v_base += tau * v_res, v_res *= (1 - tau).
+
+        Only works when v_base and v_res have identical architectures (same param shapes).
+        Raises RuntimeError if shapes mismatch.
+        """
+        base_params = list(self.v_base.parameters())
+        res_params = list(self.v_res.parameters())
+        if len(base_params) != len(res_params):
+            raise RuntimeError(
+                f"Cannot absorb: v_base has {len(base_params)} param groups, "
+                f"v_res has {len(res_params)}. Architectures must match.")
+        with torch.no_grad():
+            for p_base, p_res in zip(base_params, res_params):
+                if p_base.shape != p_res.shape:
+                    raise RuntimeError(
+                        f"Cannot absorb: shape mismatch {p_base.shape} vs {p_res.shape}. "
+                        f"Architectures must match.")
+                p_base.data.add_(p_res.data, alpha=tau)
+                p_res.data.mul_(1.0 - tau)
 
     # --------------------------------------------------------------- sampling
     def sample_action(
@@ -431,6 +454,16 @@ class SACResidualFlow(nn.Module):
         traj_t = list(reversed(rev_traj_t))
         return traj_a, traj_t
 
+    @torch.no_grad()
+    def _one_step_fp_inversion(self, a_next: Tensor, t_k: Tensor,
+                               cond: Dict[str, Tensor]) -> Tensor:
+        """Find a_inv such that a_inv + v_base(a_inv, t_k)*dt = a_next via FP iteration."""
+        dt = 1.0 / self.inference_steps
+        a_inv = a_next - self.v_base(a_next, t_k, cond) * dt
+        for _ in range(self.perstep_fp_iters):
+            a_inv = a_next - self.v_base(a_inv, t_k, cond) * dt
+        return a_inv
+
     def backward_base_logprob(self, a_Km1: Tensor, cond: Dict[str, Tensor]) -> Tensor:
         """Compute log p_base^det(a^{K-1}) where a^{K-1} = a_Km1.
 
@@ -485,14 +518,125 @@ class SACResidualFlow(nn.Module):
 
         return log_p0 - sum_logdet
 
+    # ------------------------------------------------------------- per-step KL
+    def compute_perstep_kl_and_action(self, cond: Dict[str, Tensor]):
+        """Per-step KL with one-step FP inversion at each ODE step.
+
+        At each step k, finds a^k_inv via FP inversion of the base map, then
+        KL_k = logdet(I + J_base(a^k_inv)*dt) - logdet(I + J_combined(a^k)*dt).
+        Uses exact slogdet (perstep_exact) or Hutchinson trace (perstep_hutchinson).
+
+        Returns same signature as compute_kl_and_action.
+        """
+        B = cond["state"].shape[0]
+        device = self.device
+        K = self.inference_steps
+        dt = 1.0 / K
+        D = self.act_dim_total
+        use_hutchinson = self.kl_mode == "perstep_hutchinson"
+
+        a = torch.randn(B, self.horizon_steps, self.action_dim, device=device)
+        log_p0 = Normal(torch.zeros_like(a), 1.0).log_prob(a).sum(dim=(-2, -1))
+
+        sum_kl = torch.zeros(B, device=device)
+        sum_logdet_combined = torch.zeros(B, device=device)
+        traj_a = []
+        traj_t = []
+
+        if not use_hutchinson:
+            I_D = torch.eye(D, device=device).unsqueeze(0)
+
+        for k in range(K - 1):
+            t = torch.full((B,), k * dt, device=device)
+            traj_a.append(a)
+            traj_t.append(t)
+
+            v = self._combined_velocity(a, t, cond)
+            a_next = a + v * dt
+
+            # One-step FP inversion (no_grad) + differentiable refinement
+            a_inv_ng = self._one_step_fp_inversion(a_next, t, cond)
+            v_at_inv = self.v_base(a_inv_ng, t, cond)
+            a_inv = a_next - v_at_inv * dt
+
+            if use_hutchinson:
+                a_flat = a.view(B, D)
+                a_inv_flat = a_inv.view(B, D)
+                tr_combined = torch.zeros(B, device=device)
+                tr_base = torch.zeros(B, device=device)
+
+                for _ in range(self.hutchinson_samples):
+                    v_probe = torch.randint(0, 2, (B, D), device=device).float() * 2 - 1
+
+                    def vel_comb(af, _t=t, _c=cond):
+                        aa = af.view(B, self.horizon_steps, self.action_dim)
+                        return self._combined_velocity(aa, _t, _c).view(B, D)
+
+                    def vel_base(af, _t=t, _c=cond):
+                        aa = af.view(B, self.horizon_steps, self.action_dim)
+                        return self.v_base(aa, _t, _c).view(B, D)
+
+                    _, Jv_c = torch.func.jvp(vel_comb, (a_flat,), (v_probe,))
+                    _, Jv_b = torch.func.jvp(vel_base, (a_inv_flat,), (v_probe,))
+                    tr_combined = tr_combined + (v_probe * Jv_c).sum(dim=-1)
+                    tr_base = tr_base + (v_probe * Jv_b).sum(dim=-1)
+
+                tr_combined = tr_combined / self.hutchinson_samples
+                tr_base = tr_base / self.hutchinson_samples
+                logdet_combined_k = tr_combined * dt
+                logdet_base_k = tr_base * dt
+            else:
+                cond_state = cond["state"]
+                J_comb = vmap(jacrev(self._per_sample_combined_velocity_flat, argnums=0))(
+                    a.view(B, D), t, cond_state
+                )
+                M_c = I_D + J_comb * dt
+                _, logdet_combined_k = torch.linalg.slogdet(M_c)
+
+                J_base = vmap(jacrev(self._per_sample_base_velocity_flat, argnums=0))(
+                    a_inv.view(B, D), t, cond_state
+                )
+                M_b = I_D + J_base * dt
+                _, logdet_base_k = torch.linalg.slogdet(M_b)
+
+            sum_logdet_combined = sum_logdet_combined + logdet_combined_k
+            sum_kl = sum_kl + (logdet_base_k - logdet_combined_k)
+            a = a_next
+
+        log_p_theta = log_p0 - sum_logdet_combined
+        log_p_base = log_p_theta - sum_kl
+        kl = torch.nan_to_num(sum_kl, nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
+
+        # Jac reg on v_res
+        jac_reg = a.new_zeros(())
+        if self.jac_weight > 0:
+            for i in range(K - 1):
+                J_res = vmap(jacrev(self._per_sample_residual_velocity_flat, argnums=0))(
+                    traj_a[i].view(B, D), traj_t[i], cond["state"]
+                )
+                jac_reg = jac_reg + (J_res ** 2).sum(dim=(-2, -1)).mean() * dt
+            jac_reg = jac_reg / (K - 1)
+
+        # Final noisy step
+        a_Km1 = a
+        t_last = torch.full((B,), (K - 1) * dt, device=device)
+        v_last = self._combined_velocity(a_Km1, t_last, cond)
+        sigma = self.sigma_head(cond["state"])
+        eps = torch.randn_like(a_Km1).clamp(-self.randn_clip_value, self.randn_clip_value)
+        a_K = (a_Km1 + v_last * dt + sigma * eps).clamp(self.act_min, self.act_max)
+
+        return a_K, kl, jac_reg, log_p_theta, log_p_base, eps, sigma
+
     # ------------------------------------------------------------- KL & Jac
     def compute_kl_and_action(self, cond: Dict[str, Tensor]):
         """Compute KL (using self.kl_mode) plus produce a fresh action and optional Jac reg.
 
         kl_mode options:
-          "exact"         — original: full Jacobian + slogdet (dangerous backward)
-          "hutchinson"    — Hutchinson trace estimator (JVP only, clean backward)
-          "detach_logdet" — exact logdet value, but detached (no slogdet gradient)
+          "exact"               — endpoint: full Jacobian + slogdet (dangerous backward)
+          "hutchinson"          — endpoint: Hutchinson trace (detached base)
+          "detach_logdet"       — endpoint: exact logdet value, detached gradient
+          "perstep_exact"       — per-step KL with one-step FP inversion + exact slogdet
+          "perstep_hutchinson"  — per-step KL with one-step FP inversion + Hutchinson trace
 
         Returns:
             a_K        : (B, Ta, Da)
@@ -503,6 +647,9 @@ class SACResidualFlow(nn.Module):
             eps        : (B, Ta, Da)  noise sample at last step
             sigma      : (B, Ta, Da)  sigma_head output
         """
+        if self.kl_mode in ("perstep_exact", "perstep_hutchinson"):
+            return self.compute_perstep_kl_and_action(cond)
+
         B = cond["state"].shape[0]
         device = self.device
         K = self.inference_steps
@@ -529,8 +676,8 @@ class SACResidualFlow(nn.Module):
             log_p_base = self.backward_base_logprob(a_Km1, cond)
 
         kl_raw = log_p_theta - log_p_base
-        kl = torch.nan_to_num(kl_raw, nan=0.0, posinf=50.0, neginf=-50.0)
-        kl = kl.clamp(-50.0, 50.0)
+        kl = torch.nan_to_num(kl_raw, nan=0.0, posinf=1e4, neginf=-1e4)
+        kl = kl.clamp(-1e4, 1e4)
 
         jac_reg = a_Km1.new_zeros(())
         if self.jac_weight > 0:
@@ -563,8 +710,8 @@ class SACResidualFlow(nn.Module):
         a_Km1, log_p_theta, _, _ = self.forward_with_logdet(cond)
         log_p_base = self.backward_base_logprob(a_Km1, cond)
         kl_raw = log_p_theta - log_p_base
-        kl = torch.nan_to_num(kl_raw, nan=0.0, posinf=50.0, neginf=-50.0)
-        return kl.clamp(-50.0, 50.0)
+        kl = torch.nan_to_num(kl_raw, nan=0.0, posinf=1e4, neginf=-1e4)
+        return kl.clamp(-1e4, 1e4)
 
     def compute_vres_l2(self, cond: Dict[str, Tensor], traj_a, traj_t):
         """||v_res||^2 averaged over trajectory steps. Simple proxy for KL.
@@ -606,10 +753,12 @@ class SACResidualFlow(nn.Module):
         KL term depends on self.kl_mode:
           "none"           — no KL, just SAC + entropy (baseline)
           "reward_penalty" — KL handled in reward, not in actor loss
-          "exact"          — full Jacobian + slogdet (original, dangerous backward)
-          "hutchinson"     — trace estimator (clean backward)
-          "detach_logdet"  — exact value, detached gradient (weak KL signal)
-          "vres_l2"        — ||v_res||^2 proxy (no Jacobians)
+          "exact"              — full Jacobian + slogdet (original, dangerous backward)
+          "hutchinson"         — trace estimator (clean backward)
+          "detach_logdet"      — exact value, detached gradient (weak KL signal)
+          "perstep_exact"      — per-step KL with one-step FP inversion + exact slogdet
+          "perstep_hutchinson" — per-step KL with one-step FP inversion + Hutchinson
+          "vres_l2"            — ||v_res||^2 proxy (no Jacobians)
         """
         import math
 
