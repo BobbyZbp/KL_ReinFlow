@@ -75,16 +75,22 @@ train:
     num: 0
   reward_scale_running: false        # off-policy: do not running-normalize rewards
   reward_scale_const: 1.0
-  alpha: 0.1                          # SAC entropy weight (release default); prevents Q-overestimation
+  auto_entropy_tuning: true             # SB3-style learnable alpha (log_alpha optimized with Adam)
+  init_alpha: 0.1                      # initial alpha value (auto-tuning starts from here)
+  target_entropy: -12                  # -action_dim * act_steps = -3 * 4 (SB3: -prod(action_shape))
+  alpha_lr: 3.0e-4                     # learning rate for log_alpha (SB3 default)
+  alpha: 0.1                           # fallback if auto_entropy_tuning=false
   kl_weight: 0.0                      # weight on KL(theta || base) via change of variables
   jac_weight: 0.0                     # weight on ||J_res||_F^2 Frobenius regularizer
-  sigma_entropy_weight: 0.1           # proxy entropy via Gaussian noise head
+  sigma_entropy_weight: 0.0           # deprecated: sigma_ent_loss removed (redundant with entropy_loss)
   critic_warmup_iters: 5000           # critic-only training before actor updates begin
   kl_mode: none                       # none | reward_penalty | hutchinson | detach_logdet | vres_l2 | exact | perstep_exact | perstep_hutchinson | perstep_exact_ref | perstep_hutchinson_ref
   kl_reward_weight: 0.0               # weight for KL reward penalty (kl_mode=reward_penalty)
   vres_l2_weight: 0.0                 # weight for ||v_res||^2 penalty (kl_mode=vres_l2)
   hutchinson_samples: 1               # Hutchinson trace samples (kl_mode=hutchinson or perstep_hutchinson)
   perstep_fp_iters: 10               # FP iterations for per-step KL inversion (kl_mode=perstep_*)
+  critic_grad_clip: null              # no clipping (standard SAC); set to e.g. 1000 for safety net
+  actor_grad_clip: 1.0                # keep: actor gradient path through ODE is genuinely ill-conditioned
   ema_absorb_freq: 0                  # EMA every N actor updates (0=disabled); ref modes update ref_v_res, others absorb into v_base
   ema_absorb_tau: 0.01                # EMA rate: ref modes: ref_v_res←(1-tau)*ref_v_res+tau*v_res; others: v_base+=tau*v_res
   verbose: false

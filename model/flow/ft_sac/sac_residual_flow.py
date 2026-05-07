@@ -914,32 +914,28 @@ class SACResidualFlow(nn.Module):
         q_min = torch.min(q1, q2)
         sac_loss = -q_min.mean()
 
-        sigma_entropy = sigma.log().sum(dim=(-2, -1)).mean()
-        sigma_ent_loss = -self.sigma_entropy_weight * sigma_entropy
+        # Noise-layer log-prob (eps is detached, so gradient only flows through -log(sigma))
+        log_prob = (
+            -0.5 * eps.pow(2) - sigma.log() - 0.5 * math.log(2.0 * math.pi)
+        ).sum(dim=(-2, -1))
+        log_prob_mean = log_prob.mean()
 
-        # SAC entropy: alpha * log_prob (all modes)
-        # eps^2 is detached noise, so only -log(sigma) contributes gradient
-        entropy_loss = a_K.new_zeros(())
-        if self.alpha > 0:
-            log_prob = (
-                -0.5 * eps.pow(2) - sigma.log() - 0.5 * math.log(2.0 * math.pi)
-            ).sum(dim=(-2, -1))
-            entropy_loss = self.alpha * log_prob.mean()
+        entropy_loss = self.alpha * log_prob_mean
 
         # v_res L2 penalty using trajectory from sample_action (no redundant ODE)
         vres_loss = a_K.new_zeros(())
         if use_vres_l2:
             vres_loss = self.vres_l2_weight * self.compute_vres_l2(obs, traj_a, traj_t)
 
-        total = sac_loss + kl_loss + jac_loss + sigma_ent_loss + entropy_loss + vres_loss
+        total = sac_loss + kl_loss + jac_loss + entropy_loss + vres_loss
 
         info = {
             "loss_sac": sac_loss.item(),
             "loss_kl": kl_loss.item(),
             "loss_jac": jac_loss.item(),
-            "loss_sigma_ent": sigma_ent_loss.item(),
             "loss_entropy": entropy_loss.item(),
             "loss_vres_l2": vres_loss.item(),
+            "log_prob_mean": log_prob_mean.item(),
             "q_mean": q_min.mean().item(),
             "sigma_mean": sigma.mean().item(),
             "sigma_min": sigma.min().item(),

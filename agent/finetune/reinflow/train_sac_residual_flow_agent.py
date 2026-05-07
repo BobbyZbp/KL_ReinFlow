@@ -56,7 +56,23 @@ class TrainSACResidualFlowAgent(TrainAgent):
         self.n_eval_episode = cfg.train.n_eval_episode
         self.n_explore_steps = cfg.train.n_explore_steps
 
-        self.alpha = cfg.train.get("alpha", self.model.alpha)
+        # Entropy temperature (alpha)
+        self.auto_entropy_tuning = cfg.train.get("auto_entropy_tuning", True)
+        if self.auto_entropy_tuning:
+            self.target_entropy = cfg.train.get(
+                "target_entropy", -float(cfg.action_dim * cfg.act_steps)
+            )
+            init_alpha = cfg.train.get("init_alpha", 0.1)
+            self.log_alpha = torch.tensor(
+                np.log(init_alpha), dtype=torch.float32,
+                device=self.device, requires_grad=True,
+            )
+            self.alpha_optimizer = torch.optim.Adam(
+                [self.log_alpha], lr=cfg.train.get("alpha_lr", 3e-4)
+            )
+            self.alpha = init_alpha
+        else:
+            self.alpha = cfg.train.get("alpha", 0.1)
         self.model.alpha = self.alpha
         self.kl_weight = cfg.train.get("kl_weight", self.model.kl_weight)
         self.jac_weight = cfg.train.get("jac_weight", self.model.jac_weight)
@@ -80,6 +96,9 @@ class TrainSACResidualFlowAgent(TrainAgent):
         self.ema_absorb_tau = cfg.train.get("ema_absorb_tau", 0.01)
         self.actor_update_count = 0
 
+        self.critic_grad_clip = cfg.train.get("critic_grad_clip", None)
+        self.actor_grad_clip = cfg.train.get("actor_grad_clip", 1.0)
+
         # n_steps per outer iteration is set by parent TrainAgent.__init__ from cfg.train.n_steps.
         # Default to 1 to mimic standard SAC if parent didn't set it.
         if not hasattr(self, "n_steps"):
@@ -87,12 +106,16 @@ class TrainSACResidualFlowAgent(TrainAgent):
 
         self.resume_path = cfg.get("resume_path", None)
 
+        alpha_info = (
+            f"auto_alpha(init={self.alpha:.3f} target_H={self.target_entropy:.1f})"
+            if self.auto_entropy_tuning else f"fixed_alpha={self.alpha}"
+        )
         log.info(
             f"SACResidualFlow trainer: gamma={self.gamma} tau={self.target_ema_rate} "
             f"batch={self.batch_size} critic_freq={self.critic_update_freq} "
             f"actor_freq={self.actor_update_freq} explore_steps={self.n_explore_steps} "
-            f"alpha={self.alpha} kl_w={self.kl_weight} jac_w={self.jac_weight} "
-            f"sigma_ent_w={self.sigma_entropy_weight} critic_warmup={self.critic_warmup_iters} "
+            f"{alpha_info} kl_w={self.kl_weight} jac_w={self.jac_weight} "
+            f"critic_warmup={self.critic_warmup_iters} "
             f"kl_mode={self.kl_mode} kl_reward_w={self.kl_reward_weight} "
             f"vres_l2_w={self.vres_l2_weight} "
             f"ema_freq={self.ema_absorb_freq} ema_tau={self.ema_absorb_tau}"
@@ -107,6 +130,9 @@ class TrainSACResidualFlowAgent(TrainAgent):
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "actor_update_count": self.actor_update_count,
         }
+        if self.auto_entropy_tuning:
+            data["log_alpha"] = self.log_alpha.detach().cpu()
+            data["alpha_optimizer"] = self.alpha_optimizer.state_dict()
         if replay_buffers is not None:
             data["replay"] = {
                 k: list(v) for k, v in replay_buffers.items()
@@ -136,6 +162,13 @@ class TrainSACResidualFlowAgent(TrainAgent):
             self.actor_optimizer.load_state_dict(data["actor_optimizer"])
         if "critic_optimizer" in data:
             self.critic_optimizer.load_state_dict(data["critic_optimizer"])
+        if self.auto_entropy_tuning and "log_alpha" in data:
+            self.log_alpha.data.copy_(data["log_alpha"].to(self.device))
+            self.alpha = self.log_alpha.exp().item()
+            self.model.alpha = self.alpha
+            if "alpha_optimizer" in data:
+                self.alpha_optimizer.load_state_dict(data["alpha_optimizer"])
+            log.info(f"Restored log_alpha={self.log_alpha.item():.4f} (alpha={self.alpha:.6f})")
         self.itr = data["itr"] + 1
         self.actor_update_count = data.get("actor_update_count", 0)
         self._resumed_replay = data.get("replay", None)
@@ -373,7 +406,10 @@ class TrainSACResidualFlowAgent(TrainAgent):
                 else:
                     self.critic_optimizer.zero_grad()
                     loss_critic.backward()
-                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.critic.parameters(), max_norm=10.0)
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.critic.parameters(),
+                        max_norm=self.critic_grad_clip if self.critic_grad_clip else float('inf'),
+                    )
                     self.critic_optimizer.step()
                     self.model.update_target_critic(self.target_ema_rate)
                     last_critic_info["grad_norm"] = critic_grad_norm.item()
@@ -395,10 +431,22 @@ class TrainSACResidualFlowAgent(TrainAgent):
                         loss_actor.backward()
                         actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                             list(self.model.v_res.parameters()) + list(self.model.sigma_head.parameters()),
-                            max_norm=1.0,
+                            max_norm=self.actor_grad_clip if self.actor_grad_clip else float('inf'),
                         )
                         self.actor_optimizer.step()
                         last_actor_info["grad_norm"] = actor_grad_norm.item()
+
+                        # Auto-tune alpha (SB3-style: gradient w.r.t. log_alpha is -(logp + H_target))
+                        if self.auto_entropy_tuning:
+                            log_prob_val = last_actor_info.get("log_prob_mean", 0.0)
+                            alpha_loss = -(self.log_alpha * (log_prob_val + self.target_entropy))
+                            self.alpha_optimizer.zero_grad()
+                            alpha_loss.backward()
+                            self.alpha_optimizer.step()
+                            self.alpha = self.log_alpha.exp().item()
+                            self.model.alpha = self.alpha
+                            last_actor_info["alpha"] = self.alpha
+                            last_actor_info["alpha_loss"] = alpha_loss.item()
 
                         self.actor_update_count += 1
                         if self.ema_absorb_freq > 0 and self.actor_update_count % self.ema_absorb_freq == 0:
