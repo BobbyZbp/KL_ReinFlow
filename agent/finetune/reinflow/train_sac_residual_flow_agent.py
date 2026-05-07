@@ -74,10 +74,25 @@ class TrainSACResidualFlowAgent(TrainAgent):
         else:
             self.alpha = cfg.train.get("alpha", 0.1)
         self.model.alpha = self.alpha
-        self.kl_weight = cfg.train.get("kl_weight", self.model.kl_weight)
+        # KL weight: fixed or Lagrangian dual variable
+        self.kl_lagrangian = cfg.train.get("kl_lagrangian", False)
+        if self.kl_lagrangian:
+            self.kl_target_epsilon = cfg.train.get("kl_target_epsilon", 1.0)
+            init_eta = cfg.train.get("kl_init_eta", 1.0)
+            self.log_eta = torch.tensor(
+                np.log(init_eta), dtype=torch.float32,
+                device=self.device, requires_grad=True,
+            )
+            self.eta_optimizer = torch.optim.Adam(
+                [self.log_eta], lr=cfg.train.get("kl_eta_lr", 1e-3)
+            )
+            self.model.kl_weight = init_eta
+        else:
+            self.kl_weight = cfg.train.get("kl_weight", self.model.kl_weight)
+            self.model.kl_weight = self.kl_weight
+
         self.jac_weight = cfg.train.get("jac_weight", self.model.jac_weight)
         self.sigma_entropy_weight = cfg.train.get("sigma_entropy_weight", self.model.sigma_entropy_weight)
-        self.model.kl_weight = self.kl_weight
         self.model.jac_weight = self.jac_weight
         self.model.sigma_entropy_weight = self.sigma_entropy_weight
         self.critic_warmup_iters = cfg.train.get("critic_warmup_iters", 0)
@@ -110,11 +125,15 @@ class TrainSACResidualFlowAgent(TrainAgent):
             f"auto_alpha(init={self.alpha:.3f} target_H={self.target_entropy:.1f})"
             if self.auto_entropy_tuning else f"fixed_alpha={self.alpha}"
         )
+        kl_info = (
+            f"lagrangian(eps={self.kl_target_epsilon} init_eta={self.model.kl_weight:.3f})"
+            if self.kl_lagrangian else f"kl_w={self.model.kl_weight}"
+        )
         log.info(
             f"SACResidualFlow trainer: gamma={self.gamma} tau={self.target_ema_rate} "
             f"batch={self.batch_size} critic_freq={self.critic_update_freq} "
             f"actor_freq={self.actor_update_freq} explore_steps={self.n_explore_steps} "
-            f"{alpha_info} kl_w={self.kl_weight} jac_w={self.jac_weight} "
+            f"{alpha_info} {kl_info} jac_w={self.jac_weight} "
             f"critic_warmup={self.critic_warmup_iters} "
             f"kl_mode={self.kl_mode} kl_reward_w={self.kl_reward_weight} "
             f"vres_l2_w={self.vres_l2_weight} "
@@ -133,6 +152,9 @@ class TrainSACResidualFlowAgent(TrainAgent):
         if self.auto_entropy_tuning:
             data["log_alpha"] = self.log_alpha.detach().cpu()
             data["alpha_optimizer"] = self.alpha_optimizer.state_dict()
+        if self.kl_lagrangian:
+            data["log_eta"] = self.log_eta.detach().cpu()
+            data["eta_optimizer"] = self.eta_optimizer.state_dict()
         if replay_buffers is not None:
             data["replay"] = {
                 k: list(v) for k, v in replay_buffers.items()
@@ -169,6 +191,12 @@ class TrainSACResidualFlowAgent(TrainAgent):
             if "alpha_optimizer" in data:
                 self.alpha_optimizer.load_state_dict(data["alpha_optimizer"])
             log.info(f"Restored log_alpha={self.log_alpha.item():.4f} (alpha={self.alpha:.6f})")
+        if self.kl_lagrangian and "log_eta" in data:
+            self.log_eta.data.copy_(data["log_eta"].to(self.device))
+            self.model.kl_weight = self.log_eta.exp().item()
+            if "eta_optimizer" in data:
+                self.eta_optimizer.load_state_dict(data["eta_optimizer"])
+            log.info(f"Restored log_eta={self.log_eta.item():.4f} (eta={self.model.kl_weight:.6f})")
         self.itr = data["itr"] + 1
         self.actor_update_count = data.get("actor_update_count", 0)
         self._resumed_replay = data.get("replay", None)
@@ -418,6 +446,8 @@ class TrainSACResidualFlowAgent(TrainAgent):
                 # ---- actor step (delayed; skipped during critic warmup)
                 past_warmup = self.itr >= self.n_explore_steps + self.critic_warmup_iters
                 if past_warmup and self.itr % self.actor_update_freq == 0:
+                    if self.kl_lagrangian:
+                        self.model.kl_weight = self.log_eta.exp().item()
                     loss_actor, last_actor_info = self.model.loss_actor(obs_dict)
                     if not torch.isfinite(loss_actor):
                         log.error(f"iter {self.itr}: actor loss is {loss_actor.item()}, skipping update")
@@ -447,6 +477,17 @@ class TrainSACResidualFlowAgent(TrainAgent):
                             self.model.alpha = self.alpha
                             last_actor_info["alpha"] = self.alpha
                             last_actor_info["alpha_loss"] = alpha_loss.item()
+
+                        # Lagrangian dual: update eta so E[KL] ≈ epsilon
+                        if self.kl_lagrangian and "kl_mean" in last_actor_info:
+                            eta = self.log_eta.exp()
+                            eta_loss = eta * (self.kl_target_epsilon - last_actor_info["kl_mean"])
+                            self.eta_optimizer.zero_grad()
+                            eta_loss.backward()
+                            self.eta_optimizer.step()
+                            self.model.kl_weight = self.log_eta.exp().item()
+                            last_actor_info["eta"] = self.log_eta.exp().item()
+                            last_actor_info["eta_loss"] = eta_loss.item()
 
                         self.actor_update_count += 1
                         if self.ema_absorb_freq > 0 and self.actor_update_count % self.ema_absorb_freq == 0:

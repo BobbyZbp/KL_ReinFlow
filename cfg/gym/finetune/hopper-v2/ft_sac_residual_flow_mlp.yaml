@@ -80,7 +80,11 @@ train:
   target_entropy: -12                  # -action_dim * act_steps = -3 * 4 (SB3: -prod(action_shape))
   alpha_lr: 3.0e-4                     # learning rate for log_alpha (SB3 default)
   alpha: 0.1                           # fallback if auto_entropy_tuning=false
-  kl_weight: 0.0                      # weight on KL(theta || base) via change of variables
+  kl_weight: 0.0                      # weight on KL(theta || base) via change of variables (ignored if kl_lagrangian=true)
+  kl_lagrangian: false                 # Lagrangian dual: learnable eta replaces fixed kl_weight
+  kl_target_epsilon: 1.0               # KL constraint: E[KL] <= epsilon (Lagrangian target)
+  kl_init_eta: 1.0                     # initial Lagrange multiplier
+  kl_eta_lr: 1.0e-3                    # learning rate for log_eta
   jac_weight: 0.0                     # weight on ||J_res||_F^2 Frobenius regularizer
   sigma_entropy_weight: 0.0           # deprecated: sigma_ent_loss removed (redundant with entropy_loss)
   critic_warmup_iters: 5000           # critic-only training before actor updates begin
