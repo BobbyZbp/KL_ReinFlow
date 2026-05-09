@@ -311,6 +311,67 @@ train:
 
 **Key finding:** the NaN killer is `slogdet` backward (requiring `M^{-1}` where `M = I + J*dt`), NOT the FP inversion or the endpoint formulation itself. Hutchinson eliminates slogdet backward entirely. Per-step exact also avoids it because single-step `I + J*dt` stays well-conditioned (eigenvalues bounded away from 0 for small `||J*dt||`), while endpoint accumulates K-1 steps of Jacobian products that can become near-singular.
 
+### Why slogdet backward is the NaN killer
+
+The **forward** computation `slogdet(M)` returns `log|det(M)|`, which is finite as long as `det(M) ≠ 0`. The **backward** is the problem. The gradient of `log|det(M)|` w.r.t. `M` is:
+
+```
+∂/∂M log|det(M)| = M^{-T}
+```
+
+This requires **inverting** `M = I + J·dt`. If any eigenvalue of `J·dt` is near `-1`, then `M` has a near-zero eigenvalue, `M^{-1}` explodes → NaN gradients → NaN actor loss → NaN poisons Q targets → permanent death.
+
+**Why endpoint is worse than per-step:** For endpoint KL, the Jacobian `J` is evaluated at points along the combined trajectory, which drifts from the base policy's training distribution as `v_res` grows. Out-of-distribution points can produce `J` with large negative eigenvalues. The endpoint formulation compounds this across K-1 steps — one bad Jacobian anywhere in the chain kills the entire gradient.
+
+For per-step KL, each `logdet(I + J·dt)` is independent. With `dt = 0.25` and `||J||` moderate at early training, the eigenvalues of `I + J·dt` stay bounded away from 0. That's why per-step exact ran 40k+ iterations without NaN while endpoint exact died at ~7k.
+
+### How Hutchinson avoids slogdet backward
+
+Hutchinson replaces `log|det(I + J·dt)|` with a first-order Taylor approximation:
+
+```
+log det(I + M) ≈ tr(M) = tr(J)·dt
+```
+
+The trace is estimated via `v^T J v` using JVPs (Jacobian-vector products):
+
+```python
+v_probe = rademacher(B, D)
+_, Jv = torch.func.jvp(vel_fn, (a,), (v_probe,))
+tr_est = (v_probe * Jv).sum(dim=-1)
+```
+
+The backward of a JVP is a VJP composition — **standard chain rule, no matrix inverse anywhere.** No `M^{-1}`, no slogdet, no near-singular matrices. Fully NaN-safe by construction.
+
+### Hutchinson Taylor error for discrete change of variables
+
+The Taylor approximation `log det(I + M) ≈ tr(M)` IS biased. The exact expansion is:
+
+```
+log det(I + M) = tr(M) - tr(M²)/2 + tr(M³)/3 - ...
+```
+
+Hutchinson only uses the first term `tr(M)`. The error is `O(||M||²)` where `M = J·dt`. For our setup (`dt = 0.25`, `||J||_F ≈ 2-6` depending on training stage):
+
+| Training stage | `||J·dt||_F` | Taylor rel. error |
+|---|---|---|
+| Early (iter ~1k) | ~0.5 | 3-4% |
+| Mid (iter ~100k) | ~1.0 | 8-10% |
+| Late (iter ~200k) | ~1.5 | 15-30% |
+
+**For KL regularization, this bias is mostly harmless.** The KL weight `λ` is a tuned hyperparameter — a 20% biased KL at `λ=0.05` is functionally equivalent to exact KL at `λ=0.04`. The gradient still pushes in the right direction (penalizing divergence from base), even if the magnitude is off. The weight is tuned empirically regardless.
+
+**Could Hutchinson be made exact?** Yes — use higher-order trace terms:
+
+```
+tr(M²) via v^T M² v = v^T M (M v)    — 2 sequential JVPs
+tr(M³) via v^T M³ v                   — 3 sequential JVPs
+```
+
+But for D=12, exact `jacrev` costs 12 backward passes and gives the **full Jacobian** + **exact logdet**. Higher-order Hutchinson with even 2 terms costs `2 × n_probes` JVPs. The exact Jacobian is cheaper and more accurate at this problem size. Hutchinson's advantage only kicks in at large D (like D=480 in pi0.5, where 32-64 JVPs << 480 backward passes).
+
+**Bottom line for D=12 Hopper:** use per-step exact (combo 5) — it's stable, accurate, and cheaper than multi-probe Hutchinson. Hutchinson is the fallback for when exact slogdet NaNs (endpoint KL) or for scaling to larger action spaces.
+
 ### Which to prioritize
 
 **Run 5** (per-step + exact + fixed): the most informative experiment. One-step FP inversion is well-conditioned, slogdet on a single step is safer than endpoint. Retains full nonlinear logdet structure and true cross-entropy signal. Tests whether per-step KL with exact logdet is stable in practice.

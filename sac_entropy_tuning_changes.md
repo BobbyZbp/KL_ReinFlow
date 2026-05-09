@@ -161,3 +161,72 @@ downward force (Q-gradient through the noisy action).
 target_entropy = -12`. As alpha shrinks, the entropy pressure on sigma weakens, sigma
 finds an equilibrium, and KL's relative contribution to the actor loss grows. This is
 when KL should start differentiating runs.
+
+---
+
+## Lagrangian Dual Variable for Adaptive KL Weight
+
+### 3. KL Lagrange multiplier (MPO-style)
+
+**Files**: `train_sac_residual_flow_agent.py`, `ft_sac_residual_flow_mlp.yaml`
+
+**Problem**: With a fixed `kl_weight`, the KL loss is 0.02-0.05% of the SAC loss
+magnitude. The Q-gradient dominates the actor update, and KL has no meaningful
+regularizing effect. Even worse, KL needs to be effective *early* in training (when
+alpha is still high and Q-values are growing) to prevent catastrophic forgetting —
+auto-entropy tuning alone doesn't solve this.
+
+**Solution**: Replace the fixed `kl_weight` with a learnable Lagrange multiplier `eta`
+(optimized in log-space) that enforces a soft constraint `E[KL] <= epsilon`. This is
+the standard approach from MPO/V-MPO (Abdolmaleki et al. 2018).
+
+The actor loss becomes:
+
+```
+actor_loss = -Q_min + eta.detach() * KL + alpha * log_prob
+```
+
+After each actor update, the dual variable is updated:
+
+```
+eta_loss = eta * (epsilon - KL.detach().mean())
+```
+
+- When `KL > epsilon`: `eta_loss < 0`, gradient pushes `log_eta` up → eta increases →
+  stronger KL penalty next step
+- When `KL < epsilon`: `eta_loss > 0`, gradient pushes `log_eta` down → eta decreases →
+  weaker KL penalty next step
+
+The log-space parameterization (`eta = exp(log_eta)`) ensures eta stays positive. The
+`.detach()` calls are critical: `eta` treats KL as a fixed signal (dual problem), while
+the actor treats `eta` as a fixed weight (primal problem).
+
+**Why this works when fixed kl_weight doesn't**: eta automatically scales to match the
+Q-gradient magnitude. If Q-values are ~800 and KL is ~3, eta will rise until
+`eta * KL ≈ O(Q)` — the optimizer has no choice but to attend to the KL term. A fixed
+weight of 0.05 produces `0.05 * 3 = 0.15` against a Q-gradient of 800 — invisible.
+
+Config defaults:
+- `kl_lagrangian: false` (off by default, backwards compatible)
+- `kl_target_epsilon: 1.0` (KL budget; start with 1.0-5.0)
+- `kl_init_eta: 1.0` (initial multiplier)
+- `kl_eta_lr: 1e-3` (dual variable learning rate)
+
+Checkpointing: `log_eta` and `eta_optimizer` are saved/restored on resume.
+
+WandB logging: `actor/eta` (current multiplier) and `actor/eta_loss` (dual loss) are
+logged automatically via `last_actor_info`.
+
+### Usage
+
+To enable, set in the experiment config:
+```yaml
+train:
+  kl_lagrangian: true
+  kl_target_epsilon: 1.0    # tune this: smaller = tighter KL constraint
+  kl_init_eta: 1.0
+  kl_eta_lr: 1.0e-3
+  kl_mode: perstep_exact     # or any KL mode that produces kl_mean
+```
+
+The `kl_weight` field in the config is ignored when `kl_lagrangian: true`.

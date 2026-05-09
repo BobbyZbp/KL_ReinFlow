@@ -112,8 +112,11 @@ def build_model(device, base_policy_path):
     return model
 
 
-def collect_real_obs(model, device, n_obs=256):
-    """Roll out the base policy in Hopper-v2 to collect real observations."""
+def collect_real_obs(model, device, n_obs=256, env_seed=42):
+    """Roll out the current policy in Hopper-v2 to collect on-policy observations.
+
+    Uses a fixed env seed so the same policy always produces the same obs batch.
+    """
     import gym
     import d4rl.gym_mujoco
 
@@ -122,6 +125,7 @@ def collect_real_obs(model, device, n_obs=256):
     obs_max_np = norm["obs_max"]
 
     env = gym.make("hopper-medium-v2")
+    env.seed(env_seed)
     collected = []
     obs = env.reset()
 
@@ -307,13 +311,9 @@ def main():
     model = build_model(device, BASE_POLICY_PATH)
     model.eval()
 
-    # Fixed noise
+    # Fixed noise (same z for all checkpoints — the ODE starting point is always N(0,I))
     torch.manual_seed(42)
     z_batch = torch.randn(args.n_samples, model.horizon_steps, model.action_dim, device=device)
-
-    # Collect REAL observations by rolling out the base policy in Hopper.
-    # Synthetic observations produce det<0 even at iter 0 (OOD for the base model).
-    obs_batch = collect_real_obs(model, device, args.n_samples)
 
     all_results = {}
     for it in iters:
@@ -332,6 +332,11 @@ def main():
         model.load_state_dict(data["model"], strict=False)
         del data
         model.eval()
+
+        # Collect on-policy observations for THIS checkpoint.
+        # Fixed env seed → same policy always produces the same obs batch.
+        # Different checkpoints get different obs (on-policy for each).
+        obs_batch = collect_real_obs(model, device, args.n_samples, env_seed=42)
 
         results = diagnose_perstep_det(model, obs_batch, z_batch, device, args.fp_iters)
         all_results[it] = results
